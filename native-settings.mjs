@@ -19,7 +19,7 @@ const active = state => Boolean(state?.running || state?.starting || state?.busy
 const chatBusy = state => Boolean(state?.starting || state?.busy || state?.contacts?.some(item => item.pending?.phase === 'model'));
 
 // 复用 DSH 原生 WebServer 和设置页插槽，不启动独立软件或第二个端口。
-export function createNativeSettingsRoute({ getController, getComments, getReport, getSpark, getWatch, getMode, getShare, getChat, getMedia, getFriends, modelSettings, configureMode, startWatch, startSpark, startChat, watchSchedule, getDiagnostics } = {}) {
+export function createNativeSettingsRoute({ getController, getComments, getReport, getSpark, getWatch, getMode, getShare, getChat, getMedia, getFriends, getOutbound, getProfileView, modelSettings, configureMode, startWatch, startSpark, startChat, watchSchedule, getDiagnostics } = {}) {
   const token = randomBytes(32).toString('hex');
   let diagnostics;
   return { kind: 'prefix', path: PREFIX, async handler(req, res) {
@@ -36,7 +36,9 @@ export function createNativeSettingsRoute({ getController, getComments, getRepor
         const chatState=chat?.state()||{}, watchState=watch.state(), shareState=share?.state()||{}, commentsState=comments.state(), video=controller.limits().state();
         const pendingWatch=watchState.pendingRequests||0,pendingChat=(chatState.contacts||[]).filter(item=>item.pending?.phase==='model').length;
         const usage={...usageLedger.state(),checkedAt:new Date().toISOString(),inProgress:{watch:pendingWatch,chat:pendingChat,total:pendingWatch+pendingChat},videoDaily:video.daily||null};
-        return send(res,200,{token,schedule:watchSchedule?.state(),interactions:interactionStatus({friend:friends?.state(),chat:chatState,share:shareState,comments:commentsState,watch:watchState,modelReady:modelSettings.state().configured}),sections:SETTINGS_SECTIONS,usage,watchOptions:optionsService.state(),video,spark:spark?.state()||{enabled:false},comments:commentsState,reports:await reports.state(),persona:controller.getPersonaMemory().snapshot(),mode:(await getMode()).state(),model:typeof modelSettings.catalog==='function'?await modelSettings.catalog():modelSettings.state(),watch:watchState,...(share?{share:shareState}:{}),...(chat?{chat:chatState}:{}),...(getMedia?{media:await(await getMedia()).status()}:{}),setup:{browser:'Microsoft Edge',audioOptional:true,independentAppRequired:false,model:'使用 DSH 已配置提供商；可选音频 Key 单独保存。'}});
+        const outbound = getOutbound ? await (await getOutbound()).state() : { enabled:false, dailyLimit:5, minIntervalSeconds:30, autoFollow:true, dmPrompt:'', todayCount:0, remaining:0, lastSentAt:null };
+        const profileView = getProfileView ? await (await getProfileView()).state() : { enabled:false, prompt:'', dailyLimit:10, todayCount:0, remaining:0 };
+        return send(res,200,{token,schedule:watchSchedule?.state(),interactions:interactionStatus({friend:friends?.state(),chat:chatState,share:shareState,comments:commentsState,watch:watchState,modelReady:modelSettings.state().configured}),sections:SETTINGS_SECTIONS,usage,watchOptions:optionsService.state(),video,spark:spark?.state()||{enabled:false},comments:commentsState,reports:await reports.state(),persona:controller.getPersonaMemory().snapshot(),mode:(await getMode()).state(),model:typeof modelSettings.catalog==='function'?await modelSettings.catalog():modelSettings.state(),watch:watchState,...(share?{share:shareState}:{}),...(chat?{chat:chatState}:{}),...(getMedia?{media:await(await getMedia()).status()}:{}),outbound,profileView,setup:{browser:'Microsoft Edge',audioOptional:true,independentAppRequired:false,model:'使用 DSH 已配置提供商；可选音频 Key 单独保存。'}});
       }
       if (req.method === 'GET' && url.pathname === `${PREFIX}/reports/read`) return send(res, 200, await (await getReport()).read({ date: url.searchParams.get('date') }));
       if (req.method === 'GET' && url.pathname === `${PREFIX}/chat/unanswered`) {
@@ -88,6 +90,16 @@ export function createNativeSettingsRoute({ getController, getComments, getRepor
         case '/spark/stop': empty(input); value = await (await getSpark()).stop({ explicit: true }); break;
         case '/spark/start': throw Object.assign(new Error('自动续火花功能已移除。'),{status:410});
         case '/spark/resolve': value = await (await getSpark()).resolve(input, { explicit: true }); break;
+        case '/outbound/configure': {
+          if (Object.keys(input).some(key => !['enabled','dailyLimit','minIntervalSeconds','autoFollow','dmPrompt'].includes(key))) throw Object.assign(new Error('主动私信设置只接收开关、每日上限、最小间隔、自动关注和私信提示词。'), { status: 400 });
+          if (!getOutbound) throw Object.assign(new Error('主动私信服务尚未加载。'), { status: 503 });
+          value = await (await getOutbound()).configure(input, { explicit: true }); break;
+        }
+        case '/profile-view/configure': {
+          if (Object.keys(input).some(key => !['enabled','dailyLimit','prompt'].includes(key))) throw Object.assign(new Error('查看主页设置只接收开关、每日上限和提示词。'), { status: 400 });
+          if (!getProfileView) throw Object.assign(new Error('查看主页服务尚未加载。'), { status: 503 });
+          value = await (await getProfileView()).configure(input, { explicit: true }); break;
+        }
         case '/comments/configure': value = await (await getComments()).configure(input, { explicit: true }); break;
         case '/comments/resolve': value = await (await getComments()).resolve(input, { explicit: true }); break;
         case '/share/configure': if(getFriends){if(Object.keys(input).some(key=>!['enabled','dailyLimit'].includes(key)))throw Object.assign(new Error('好友互动只接受总开关。'),{status:400});await(await getFriends()).configure({enabled:input.enabled},{explicit:true});value=(await getShare()).state();}else value=await(await getShare()).configure(input,{explicit:true});break;

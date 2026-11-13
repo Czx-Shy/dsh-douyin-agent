@@ -37,6 +37,8 @@
     "@playwright/mcp": "0.0.83"
   },
   "files": [
+    "app.mjs",
+    "public/index.html",
     "chat-output.mjs",
     "group-video-inbox.mjs",
     "browser-pages.mjs",
@@ -82,10 +84,12 @@
     "native-spark-greeting.mjs",
     "native-watch-decision.mjs",
     "outbound-send.mjs",
+    "outbound-message.mjs",
     "receipt-baseline.mjs",
     "persona-memory.mjs",
     "playwright-runtime.mjs",
     "public-comment-agent.mjs",
+    "profile-view.mjs",
     "qq-sync.mjs",
     "runtime-paths.mjs",
     "spark-agent.mjs",

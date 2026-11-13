@@ -6,7 +6,7 @@ import { createNativeWatchDecision } from './native-watch-decision.mjs';
 import { prepareVideoFrames } from './video-storyboard.mjs';
 import { createNativeSparkGreeting } from './native-spark-greeting.mjs?v=10';
 import { bindNativePersonaContext } from './native-persona-context.mjs';
-import { createNativeSettingsRoute } from './native-settings.mjs?v=18';
+import { createNativeSettingsRoute } from './native-settings.mjs?v=20';
 import { NativeModelSettings } from './native-model-settings.mjs?v=10';
 import { bindNativeSettingsRoutes } from './native-settings-transport.mjs?v=18';
 import { randomUUID } from 'node:crypto';
@@ -192,7 +192,7 @@ export async function apply(ctx, config = {}) {
     return sharedPersona;
   }});
   const getWatch=async(exec,starting)=>{
-    if (!watchPromise) watchPromise=Promise.all([getController(),import('./autonomous-watch.mjs?v=18')]).then(async ([controller,{AutonomousWatch}])=>{
+    if (!watchPromise) watchPromise=Promise.all([getController(),import('./autonomous-watch.mjs?v=20')]).then(async ([controller,{AutonomousWatch}])=>{
       if(starting) sharedPersona.initialize({importLegacy:false});
       const route=exec.agent?.session?.requestHeader?.()?.config ?? exec.agent?.options ?? {};
       return new AutonomousWatch({controller,videoLimits:controller.limits(),personaMemory:sharedPersona,commentService:await controller.getComments(),reportService:await controller.getReport(),source:'dsh',config:{apiKey:'',baseUrl:'https://api.deepseek.com',model:route.model||'deepseek-flash'},...(starting?{decisionProvider:createNativeWatchDecision({llm:optionalService(ctx,'llm'),attachments:optionalService(ctx,'attachments'),agent:exec.agent})}:{})});
@@ -263,6 +263,8 @@ export async function apply(ctx, config = {}) {
           getReport: async () => (await getController()).getReport(),
           getSpark: async () => (await getController()).getSparkService(),
           getShare: async () => (await getWatch(settingsExec(), false)).getShareService(),
+          getOutbound: async () => (await getController()).getOutboundMessageService(),
+          getProfileView: async () => (await getController()).getProfileViewService(),
           getChat: async () => (await getController()).getChatService(),
           getMedia: async () => (await getController()).getMediaAdapter(),
           getWatch: async () => getWatch(settingsExec(), false),

@@ -39,6 +39,8 @@
 
 同一时刻只运行一条自主观看。两版共享每日账本，暂停、重启或改设置不会清空当天用量。
 
+npm 包只包含插件与本地 API 运行所需文件（含 `app.mjs` 和 `public/` 控制台），安装后可直接 `npm start`；桌面独立软件源码 `desktop/`、`install-native.ps1` 和仓库文档只在 GitHub 仓库中提供，不在 npm 包内。
+
 ## 安装 1.4.7
 
 DSH Desktop：打开“应用 → 桌面插件”，填写 `dsh-douyin-browser-local@1.4.7` 安装或更新。Desktop profile 由 Electron 管理，不要用普通 CLI 另改一份。更新后完全退出并重新打开同一份 DSH。

@@ -342,12 +342,14 @@ export function readPageState() {
     videoIdentityConflict=Boolean(playerId&&activeId&&playerId!==activeId);
     const id = videoIdentityConflict?null:playerId || activeId || links.map(e=>workId(e.href)).find(Boolean) || workId(location.href) || null;
     const authorElement = links.find(e => /\/user\//.test(e.href)) || [...(container?.querySelectorAll('span,div')??[])].find(e=>e.childElementCount===0 && /^@/.test(clean(e.textContent)) && visible(e));
+    const authorSecUid = authorElement ? /\/user\/([A-Za-z0-9_-]+)/.exec(authorElement.getAttribute?.('href') || authorElement.href || '')?.[1] ?? null : null;
     const titleElement = container?.querySelector('[data-e2e="video-desc"],[data-e2e="video-title"],[data-e2e="detail-video-info"],[class*="video-info-detail"]');
     const detailAuthor=container?.querySelector('[data-e2e="related-video"]')?.innerText?.split('\n').map(clean).find(Boolean);
     const captionAuthor=/@([^·\n]+)·/.exec(titleElement?.textContent??'')?.[1]?.trim();
     const r = element.getBoundingClientRect();
     video = { id, url: id ? `https://www.douyin.com/video/${id}` : null,
       author: boundedAuthor(authorElement?.textContent) || boundedAuthor(detailAuthor) || boundedAuthor(captionAuthor),
+      authorSecUid,
       title: (clean(titleElement?.getAttribute('data-e2e')==='detail-video-info'?titleElement.innerText.split('\n')[0]:titleElement?.textContent) || clean(links.find(e=>workId(e.href))?.textContent)).slice(0, 1000) || null,
       time: element.currentTime, duration: Number.isFinite(element.duration) ? element.duration : null,
       paused: element.paused, muted: element.muted, readyState: element.readyState, ended:element.ended, loop:element.loop,
@@ -392,7 +394,9 @@ export function readPageState() {
         if(arrows.length===2){const a=arrows[0].getBoundingClientRect(),b=arrows[1].getBoundingClientRect();if(a.width>=12&&a.width<=64&&b.width>=12&&b.width<=64&&Math.abs(a.top-b.top)<4&&b.left>a.right&&!next.includes(arrows[1]))next.push(arrows[1]);}
       }
       const validCount=!index||!total||index<=total;
+      const imageAuthor=[...activeContainer.querySelectorAll('a[href*="/user/"]')].find(link=>visible(link));
       imagePost={id,url:`https://www.douyin.com/note/${id}`,recognized:true,source:'active-image-element',loaded:true,title:clean(activeContainer.querySelector('[data-e2e="video-desc"],[data-e2e="video-title"],[class*="video-info-detail"]')?.textContent).slice(0,1000)||null,
+        authorSecUid:imageAuthor?/\/user\/([A-Za-z0-9_-]+)/.exec(imageAuthor.getAttribute('href')||'')?.[1]??null:null,
         width:image.naturalWidth,height:image.naturalHeight,viewport:{x:Math.max(0,r.left),y:Math.max(0,r.top),width:Math.min(innerWidth,r.right)-Math.max(0,r.left),height:Math.min(innerHeight,r.bottom)-Math.max(0,r.top)},imageKey:marker((image.currentSrc||image.src)+'\0'+image.naturalWidth+'x'+image.naturalHeight+'\0'+(index||0)),album:{index:validCount?index:null,total:validCount?total:null,hasNext:validCount&&next.length===1&&!(index&&total&&index>=total),atEnd:Boolean(validCount&&index&&total&&index>=total),source:'visible-carousel-dom'},observationScope:'current-visible-image'};
     }
   }
@@ -441,9 +445,101 @@ export function readPageState() {
         title: title.slice(0,1000), author: boundedAuthor(card.querySelector('a[href*="/user/"]')?.textContent) || boundedAuthor(/@([^\n·]+)/.exec(card.innerText)?.[1]) });
     }
   }
+  // 用户搜索结果：搜索页中可见的用户卡片
+  const userSearchResults = [];
+  if (location.pathname.startsWith('/search/')) {
+    const userCards = [...document.querySelectorAll('.search-result-card')].filter(card => card.querySelector('a[href*="/user/"]') && visible(card));
+    const seenUsers = new Set();
+    const parseCount = (text) => {
+      const m = /([\d.]+)\s*(万|亿)?/.exec(text || '');
+      if (!m) return null;
+      const n = Number(m[1]);
+      if (!Number.isFinite(n)) return null;
+      return m[2] === '万' ? Math.round(n * 10000) : m[2] === '亿' ? Math.round(n * 100000000) : n;
+    };
+    for (const card of userCards) {
+      const link = card.querySelector('a[href*="/user/"]');
+      const secUid = link ? /\/user\/([A-Za-z0-9_-]+)/.exec(link.getAttribute('href'))?.[1] : null;
+      if (!secUid || seenUsers.has(secUid)) continue;
+      seenUsers.add(secUid);
+      // 卡片内叶子节点依次是：昵称、关注按钮、抖音号、获赞、粉丝、简介……
+      const leaves = [...card.querySelectorAll('*')].filter(el => el.childElementCount === 0).map(el => clean(el.textContent)).filter(Boolean);
+      const followIdx = leaves.findIndex(t => /^(?:已关注|关注|相互关注)$/.test(t));
+      const from = followIdx >= 0 ? followIdx + 1 : 0;
+      // 抖音号可能被拆成多个叶子节点，连续拼接直到获赞/粉丝等计数文本
+      const idParts = [];
+      for (const t of leaves.slice(from)) {
+        if (/(?:获赞|粉丝)$/.test(t)) break;
+        if (/抖音号/.test(t)) continue;
+        if (!/^[A-Za-z0-9_-]+$/.test(t)) break;
+        idParts.push(t);
+        if (idParts.join('').length >= 30) break;
+      }
+      const douyinId = idParts.join('') || null;
+      const followerText = leaves.find(t => /粉丝$/.test(t)) || '';
+      userSearchResults.push({
+        secUid,
+        nickname: leaves[0]?.slice(0, 100) || clean(link.textContent)?.slice(0, 100) || null,
+        douyinId: douyinId?.slice(0, 50) || null,
+        followerCount: parseCount(followerText),
+        followed: followIdx >= 0 && /已关注|相互关注/.test(leaves[followIdx]),
+      });
+    }
+  }
+  // 用户主页：解析资料和首屏作品列表
+  let userProfile = null;
+  const userSecUid = location.pathname.startsWith('/user/') ? /^\/user\/([A-Za-z0-9_-]+)/.exec(location.pathname)?.[1] : null;
+  if (userSecUid && !loginRequired && !verificationRequired && !privateChatVisible) {
+    const profileRoot = document.querySelector('[data-e2e="user-info"],[class*="userInfo"],[class*="user-info"],main') || document.body;
+    // 统计信息从整页文本提取，避免部分账号的资料区不在同一个容器内
+    const statsText = clean(document.body.textContent);
+    const parseCount = (num, unit) => {
+      const n = Number(num);
+      if (!Number.isFinite(n)) return null;
+      return unit === '万' ? Math.round(n * 10000) : unit === '亿' ? Math.round(n * 100000000) : n;
+    };
+    // 昵称：优先资料区首个叶子文本，其次页面标题
+    const nicknameLeaf = [...profileRoot.querySelectorAll('*')].filter(el => el.childElementCount === 0).map(el => clean(el.textContent)).find(t => t && t.length <= 60 && !/^(?:关注|已关注|相互关注|私信|发消息)$/.test(t));
+    const titleMatch = /^(.+?)(?:的主页)?\s*[-–]\s*抖音/.exec(document.title || '');
+    const nickname = (nicknameLeaf || titleMatch?.[1] || '').slice(0, 100) || null;
+    // 关注数：关注与粉丝之间
+    const followingMatch = /关注\s*(\d+)\s*粉丝/.exec(statsText);
+    const followingCount = followingMatch ? Number(followingMatch[1]) : null;
+    // 粉丝数：粉丝与获赞之间（可带万/亿）
+    const followerMatch = /粉丝\s*([\d.]+)\s*(万|亿)?\s*获赞/.exec(statsText);
+    const followerCount = followerMatch ? parseCount(followerMatch[1], followerMatch[2]) : null;
+    // 获赞数：获赞之后（可带万/亿）
+    const likeMatch = /获赞\s*([\d.]+)\s*(万|亿)?/.exec(statsText);
+    const likeCount = likeMatch ? parseCount(likeMatch[1], likeMatch[2]) : null;
+    // 抖音号：匹配到 IP属地、获赞等关键词之前
+    const douyinIdMatch = /抖音号[:：]\s*([A-Za-z0-9_-]+?)(?=IP属地|获赞|粉丝|$)/.exec(statsText);
+    const douyinId = douyinIdMatch?.[1]?.slice(0, 50) || null;
+    // 简介：IP属地 + 省份 + 性别 + 省份·城市 之后到"更多/分享主页"等界面文字之前
+    const bioMatch = /IP属地[：:]\s*[^男女·\s]{2,4}(?:男|女)?[^·\s]{0,4}·?[^·\s]{2,4}\s*(.+?)(?:\.{2,}更多|更多|分享主页|互相关注|私信|下载电脑客户端|作品|$)/.exec(statsText);
+    const bio = bioMatch?.[1]?.trim()?.slice(0, 500) || null;
+    const verified = profileRoot.querySelector('[data-e2e="verify-badge"],[class*="verify-badge"],[class*="verified"]') !== null || /官方认证|企业认证|机构认证/.test(statsText);
+    // 作品列表：在整个文档中查找作品链接
+    const works = [];
+    const workAnchors = [...document.querySelectorAll('a[href*="/video/"],a[href*="/note/"]')].filter(a => visible(a)).slice(0, 30);
+    const seenWorks = new Set();
+    for (const anchor of workAnchors) {
+      const id = workId(anchor.href);
+      if (!id || seenWorks.has(id)) continue;
+      seenWorks.add(id);
+      const linkText = clean(anchor.textContent);
+      // 文本格式：[置顶]{点赞数}{标题}，点赞数可能是纯数字或带万/亿
+      const rest = linkText.replace(/^置顶/, '');
+      const likeAndTitle = /^([\d.]+)\s*(万|亿)?\s*(.+)$/.exec(rest);
+      const title = (likeAndTitle?.[3] || rest).slice(0, 200) || null;
+      const likeCount2 = likeAndTitle ? parseCount(likeAndTitle[1], likeAndTitle[2]) : null;
+      works.push({ id, url: `https://www.douyin.com/${/\/note\//.test(anchor.href) ? 'note' : 'video'}/${id}`, title, likeCount: likeCount2 });
+    }
+    userProfile = { secUid: userSecUid, nickname, douyinId, followerCount, followingCount, likeCount, bio, verified, works };
+  }
   const u = new URL(location.href);
   for (const key of [...u.searchParams.keys()]) if (!['modal_id','aweme_id','recommend'].includes(key)) u.searchParams.delete(key);
-  return { url: u.href, title: document.title, video, imagePost, liveRoom, videoSelection: { candidateCount: videoElements.length, ambiguous: videoElements.length > 1 || videoIdentityConflict, identityConflict: videoIdentityConflict }, pageKind: liveRoom?'live-room':livePreview ? 'live-preview' : imagePost ? 'image-post' : video?.id ? 'video' : location.pathname.startsWith('/search/') ? 'search' : 'unknown', livePreview, searchResults: searchResults.slice(0,20), visibleText: directLive?'':text,
+  const pageKind = liveRoom?'live-room':livePreview ? 'live-preview' : imagePost ? 'image-post' : video?.id ? 'video' : userProfile ? 'user-profile' : location.pathname.startsWith('/search/') ? (userSearchResults.length ? 'user-search' : 'search') : 'unknown';
+  return { url: u.href, title: document.title, video, imagePost, liveRoom, videoSelection: { candidateCount: videoElements.length, ambiguous: videoElements.length > 1 || videoIdentityConflict, identityConflict: videoIdentityConflict }, pageKind, livePreview, searchResults: searchResults.slice(0,20), userSearchResults: userSearchResults.slice(0,20), userProfile, visibleText: directLive?'':text,
     loginRequired, verificationRequired, privateChatVisible, documentReadyState: document.readyState };
 }
 
@@ -531,6 +627,8 @@ export class BrowserController {
   limits() { return this.videoLimits ??= new VideoLimits(); }
   getMediaAdapter() { return this.mediaPromise??=import('./media/index.mjs?v=10').then(({MediaAdapter})=>new MediaAdapter()); }
   getForwarder() { return this.forwarderPromise??=import('./video-forward.mjs?v=10').then(({VideoForwarder})=>new VideoForwarder({videoLimits:this.limits(),source:this.source==='dsh'?'dsh':'api'})); }
+  getOutboundMessageService() { return this.outboundPromise??=import('./outbound-message.mjs').then(({OutboundMessageService})=>new OutboundMessageService({controller:this,stateDir:this.limits().stateDir,source:this.source==='dsh'?'dsh':'api'})); }
+  getProfileViewService() { return this.profileViewPromise??=import('./profile-view.mjs').then(({ProfileViewService})=>new ProfileViewService({stateDir:this.limits().stateDir})); }
   watchVideoLimits() {
     if (!this.limitsEnabled || this.cancelLimitsWatch) return;
     this.cancelLimitsWatch = this.limits().watch({ sources:[this.source], pause:()=>this.pauseForLimits() });
@@ -577,7 +675,7 @@ export class BrowserController {
   }
   store() { return this.memory ??= new MemoryStore(resolveRuntimePaths().memoryDbPath); }
   async observeSharedWork(input) {
-    const { AutonomousWatch } = await import('./autonomous-watch.mjs?v=10');
+    const { AutonomousWatch } = await import('./autonomous-watch.mjs?v=20');
     const release = await lock('chat-shared-video', input.signal, this.controlDirectory);
     try {
       return await observeChatSharedWork({ ...input, videoLimits: this.limits(),
@@ -738,8 +836,8 @@ export class BrowserController {
     if (url === RECOMMEND && this.page.url().includes('/jingxuan')) {
       await this.page.locator('a').filter({hasText:/^推荐$/}).click();
     }
-    const targetId=/\/(?:video|note)\/(\d+)/.exec(url)?.[1];
-    await this.settle(signal, {kind:targetId?'video':url.includes('/search/')?'search':'recommend',videoId:targetId});
+    const targetId=/\/(?:video|note)\/(\d+)/.exec(url)?.[1], targetUser=/\/user\/[A-Za-z0-9_-]+/.test(url);
+    await this.settle(signal, {kind:targetId?'video':targetUser?'user':url.includes('/search/')?'search':'recommend',videoId:targetId});
   }
   async settle(signal, {kind='recommend',videoId}={}) {
     for (let i=0;i<=60;i++) {
@@ -751,11 +849,12 @@ export class BrowserController {
       const imageReady=state.pageKind==='image-post'&&state.imagePost?.recognized===true&&state.imagePost.source==='active-image-element'&&state.imagePost.loaded===true;
       if(kind==='search' && state.searchResults.length && !detail) return state;
       if(kind==='search' && /暂无搜索结果|没有找到相关|暂无结果/.test(state.visibleText)) return state;
+      if(kind==='user' && state.pageKind==='user-profile' && state.userProfile) return state;
       if(kind==='video' && detail && (state.video?.id===videoId && state.video.readyState>=2 || imageReady&&state.imagePost.id===videoId)) return state;
       if(kind==='recommend' && (state.video?.id && state.video.readyState>=2 || imageReady || state.livePreview?.recognized === true)) return state;
       if(i<60)await wait(500, signal);
     }
-    throw new Error(kind==='search'?'搜索结果未就绪，未确认搜索完成。':kind==='video'?'目标作品尚未加载完成，请读取状态后重试。':'推荐流尚未读到就绪视频。');
+    throw new Error(kind==='search'?'搜索结果未就绪，未确认搜索完成。':kind==='user'?'用户主页未就绪，请读取状态后重试。':kind==='video'?'目标作品尚未加载完成，请读取状态后重试。':'推荐流尚未读到就绪视频。');
   }
   async state({ record = true } = {}) {
     const state = await this.evaluatePage(readPageState);
@@ -822,6 +921,10 @@ export class BrowserController {
           }
         }
       }
+      if(name==='douyin_message_user') {
+        const outbound=await this.getOutboundMessageService();aborted(signal);
+        return outbound.sendToUser(args,{signal});
+      }
       if(name.startsWith('douyin_chat_')) {
         const chat=await this.getChatService();aborted(signal);
         if(name==='douyin_chat_contacts') return chat.listContacts({signal});
@@ -848,7 +951,7 @@ export class BrowserController {
       if (name==='douyin_recall') return this.store().recall({query:args.query??'',limit:args.limit??10});
       if (name==='douyin_persona_status') return this.getPersonaMemory().snapshot();
       if (name==='douyin_watch_status') {
-        const {AutonomousWatch}=await import('./autonomous-watch.mjs?v=10');
+        const {AutonomousWatch}=await import('./autonomous-watch.mjs?v=20');
         this.watchStatusReader??=new AutonomousWatch({controller:this,config:{},videoLimits:this.limits(),personaMemory:this.getPersonaMemory(),source:this.source==='dsh'?'dsh':'api',stateDir:this.limits().stateDir});
         return this.watchStatusReader.state();
       }
@@ -877,14 +980,23 @@ export class BrowserController {
         }
         await this.checkVideoLimits(name);
         if(this.limitsEnabled && !this.limits().state().allowed) await this.pauseForLimits();
-        if(!['douyin_open','douyin_search','douyin_open_video'].includes(name) && new URL(this.page.url()).origin!=='https://www.douyin.com'&&!/^https:\/\/live\.douyin\.com\/\d{4,30}\/?(?:[?#]|$)/.test(this.page.url())) {
+        if(!['douyin_open','douyin_search','douyin_open_video','douyin_search_user','douyin_open_user'].includes(name) && new URL(this.page.url()).origin!=='https://www.douyin.com'&&!/^https:\/\/live\.douyin\.com\/\d{4,30}\/?(?:[?#]|$)/.test(this.page.url())) {
           return this.page.evaluate(readPageState);
         }
         if (name==='douyin_open') await this.navigate(RECOMMEND,signal);
         if (name==='douyin_search') await this.navigate(`https://www.douyin.com/search/${encodeURIComponent(args.query)}`,signal);
+        if (name==='douyin_search_user') await this.navigate(`https://www.douyin.com/search/${encodeURIComponent(args.query)}?type=user`,signal);
+        if (name==='douyin_open_user') {
+          const userUrl = args.url || `https://www.douyin.com/user/${args.secUid}`;
+          await this.navigate(userUrl,signal);
+        }
         if (name==='douyin_open_video') {
-          if (args.url) await this.navigate(`https://www.douyin.com/video/${/\/video\/(\d+)/.exec(args.url)[1]}`,signal);
-          else {
+          if (args.url) {
+            const noteId=/\/note\/(\d+)/.exec(args.url)?.[1], videoId2=/\/video\/(\d+)/.exec(args.url)?.[1];
+            if(noteId) await this.navigate(`https://www.douyin.com/note/${noteId}`,signal);
+            else if(videoId2) await this.navigate(`https://www.douyin.com/video/${videoId2}`,signal);
+            else throw new Error('作品链接无效，请重新搜索或从主页选择。');
+          } else {
             const before = await this.state();
             const result = before.searchResults.find(item=>item.index===args.index);
             if (!result) throw new Error('这个 index 不在当前可见搜索结果内，请重新搜索。');
