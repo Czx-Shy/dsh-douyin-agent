@@ -250,21 +250,20 @@ export class OutboundMessageService {
 
     const nickname = state.userProfile.nickname || targetSecUid;
 
-    // 点击"发消息"按钮
-    const messageButton = page.locator('button:has-text("发消息"),[data-e2e="message-btn"],[class*="messageBtn"]').filter({ visible: true }).first();
-    const messageButtonCount = await messageButton.count();
-    if (messageButtonCount === 0) {
-      // 尝试通过"私信"或聊天图标
-      const altButton = page.locator('button:has-text("私信"),a:has-text("私信"),[data-e2e="chat-btn"]').filter({ visible: true }).first();
-      if (await altButton.count() === 0) {
-        throw fail('未找到"发消息"入口，对方可能关闭了私信或页面结构已变化。', 404);
+    // 打开私信：优先"发消息"，其次"私信"；页面未就绪时点击可能丢失，最多重试三次。
+    const entry = page.locator('button:has-text("发消息"),[data-e2e="message-btn"],[class*="messageBtn"],button:has-text("私信"),a:has-text("私信"),[data-e2e="chat-btn"]').filter({ visible: true }).first();
+    const editor = page.locator('[data-e2e="im-dialog"] [contenteditable="true"][data-slate-editor]').first();
+    let opened = false;
+    for (let attempt = 0; attempt < 3 && !opened; attempt++) {
+      if (!(await editor.isVisible().catch(() => false))) {
+        if (await entry.count() === 0) throw fail('未找到"发消息"入口，对方可能关闭了私信或页面结构已变化。', 404);
+        await entry.click().catch(() => {});
       }
-      await altButton.click();
-    } else {
-      await messageButton.click();
+      await page.waitForTimeout(1500);
+      opened = await editor.isVisible().catch(() => false);
     }
     signal?.throwIfAborted();
-    await page.waitForTimeout(1200);
+    if (!opened) throw fail('私信对话框未打开，可能对方不接收陌生人消息。', 403);
 
     // 检测是否需要先关注
     const followPrompt = page.locator('text=关注后即可发送消息,text=关注后才能发消息,text=请先关注对方').filter({ visible: true }).first();
@@ -281,18 +280,14 @@ export class OutboundMessageService {
       await page.waitForTimeout(1000);
       signal?.throwIfAborted();
       // 再次尝试点击发消息
-      const retryButton = page.locator('button:has-text("发消息"),[data-e2e="message-btn"]').filter({ visible: true }).first();
+      const retryButton = page.locator('button:has-text("发消息"),[data-e2e="message-btn"],button:has-text("私信")').filter({ visible: true }).first();
       if (await retryButton.count() > 0) await retryButton.click();
       await page.waitForTimeout(1200);
     }
 
-    // 等待私信对话框出现（输入框是 Slate 编辑器）
-    const editor = page.locator('[data-e2e="im-dialog"] [contenteditable="true"][data-slate-editor]').first();
-    try {
-      await editor.waitFor({ state: 'visible', timeout: 8000 });
-    } catch {
-      throw fail('私信对话框未打开，可能对方不接收陌生人消息。', 403);
-    }
+    // 核对当前会话对象，避免私信面板默认停在其他会话
+    const activeTitle = (await page.locator('[data-e2e="im-dialog"] [class*="ChatHeadertitle"]').first().innerText().catch(() => '')).trim();
+    if (activeTitle && nickname && activeTitle !== nickname) throw fail(`私信会话对象是「${activeTitle}」，与目标「${nickname}」不符，未发送。`, 409);
     signal?.throwIfAborted();
 
     // 检查已有草稿，避免覆盖
