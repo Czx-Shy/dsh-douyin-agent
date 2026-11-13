@@ -7,7 +7,7 @@ import { OutboundCoordinator } from './outbound-send.mjs';
 const DEFAULTS = Object.freeze({ enabled: false, dailyLimit: 5, minIntervalSeconds: 30, autoFollow: true, dmPrompt: '' });
 const PROMPT_MAX = 1000;
 const RESERVATION_TTL_MS = 15 * 60 * 1000;
-const SEC_UID_PATTERN = /^[A-Za-z0-9_-]{4,64}$/;
+const SEC_UID_PATTERN = /^[A-Za-z0-9_-]{4,128}$/;
 // 只接受抖音自己的域名，导航前就挡掉第三方地址。
 const DOUYIN_USER_HOSTS = new Set(['www.douyin.com', 'douyin.com']);
 const dayKey = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
@@ -16,11 +16,16 @@ const read = (file, fallback) => { try { return JSON.parse(fs.readFileSync(file,
 const write = (file, value) => { const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`; try { fs.writeFileSync(temporary, JSON.stringify(value, null, 2), { mode: 0o600, flag: 'wx' }); fs.renameSync(temporary, file); } finally { if (fs.existsSync(temporary)) fs.unlinkSync(temporary); } };
 
 // 解析作者主页地址：必须是抖音域名下的 /user/<secUid>。
+// 浏览器给的 page.url() 是完整地址，身份核对时必须取出 pathname 再比较。
+const userPathOf = value => {
+  try { return new URL(String(value)).pathname.replace(/\/+$/, ''); } catch { return ''; }
+};
+
 function parseUserUrl(value) {
   let parsed;
   try { parsed = new URL(String(value)); } catch { throw fail('作者主页地址不是有效网址，未发送。', 400); }
   if (parsed.protocol !== 'https:' || !DOUYIN_USER_HOSTS.has(parsed.hostname.toLowerCase())) throw fail('只允许打开抖音域名下的作者主页，未发送。', 400);
-  const match = /^\/user\/([A-Za-z0-9_-]{4,64})\/?$/.exec(parsed.pathname);
+  const match = /^\/user\/([A-Za-z0-9_-]{4,128})\/?$/.exec(parsed.pathname);
   if (!match) throw fail('作者主页地址必须是 /user/<secUid> 形式，未发送。', 400);
   return match[1];
 }
@@ -240,7 +245,7 @@ export class OutboundMessageService {
     if (state.pageKind !== 'user-profile') throw fail('未能打开用户主页，页面状态不符。', 400);
     // 发送前最后一次身份核对：主页归属和地址都必须指向目标作者。
     if (!state.userProfile || state.userProfile.secUid !== targetSecUid) throw fail('打开的页面不是目标作者主页，未发送。', 409);
-    const currentPath = String(page.url()).split('?')[0].split('#')[0].replace(/\/+$/, '');
+    const currentPath = userPathOf(page.url());
     if (currentPath !== `/user/${targetSecUid}`) throw fail('页面地址与目标作者不符，未发送。', 409);
 
     const nickname = state.userProfile.nickname || targetSecUid;
@@ -310,10 +315,14 @@ export class OutboundMessageService {
     if (await sendButton.count() !== 1) throw fail('未找到唯一的发送按钮，未发送。', 500);
 
     // 点击前再次核对页面归属与草稿，避免异步等待期间页面被替换或切换会话。
+    // 私信弹窗打开后 pageKind 会变成 unknown，所以以地址路径和弹窗状态为准。
     const finalState = await this.controller.state({ record: false });
-    const finalPath = String(page.url()).split('?')[0].split('#')[0].replace(/\/+$/, '');
+    const finalPath = userPathOf(page.url());
     if (finalState.loginRequired || finalState.verificationRequired) throw fail('点击前出现登录或安全验证要求，未发送。', 403);
-    if (finalState.pageKind !== 'user-profile' || finalState.userProfile?.secUid !== targetSecUid || finalPath !== `/user/${targetSecUid}`) throw fail('点击前页面已离开目标作者主页，未发送。', 409);
+    if (finalPath !== `/user/${targetSecUid}`) throw fail('点击前页面已离开目标作者主页，未发送。', 409);
+    const finalIdentity = finalState.userProfile?.secUid;
+    if (finalIdentity && finalIdentity !== targetSecUid) throw fail('点击前页面已切换到其他作者，未发送。', 409);
+    if (!finalState.privateChatVisible) throw fail('点击前私信对话已关闭，未发送。', 409);
     if (await readEditor() !== message.trim()) throw fail('点击前草稿内容已变化，未发送。', 409);
 
     // 点击前先落盘“正在发送”，进程在点击后中断也能在下次识别为结果不明。
