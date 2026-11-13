@@ -263,18 +263,30 @@ export class AutonomousWatch {
   async visitAuthor(observedState) {
     const service = await this.controller.getProfileViewService?.();
     if (!service) throw Object.assign(new Error('查看主页服务未加载，未打开主页。'), { code: 'WATCH_DECISION_FORMAT' });
-    try { service.checkQuota(); } catch (error) { error.code ||= 'WATCH_DECISION_FORMAT'; throw error; }
     const secUid = observedState.video?.authorSecUid;
     if (!secUid) throw Object.assign(new Error('当前作品没有可核对的作者主页地址，未打开主页。'), { code: 'WATCH_DECISION_FORMAT' });
+    // 额度在锁内预留，主页读取成功后再结算，避免两个入口同时通过检查。
+    let reservationId;
+    try { reservationId = await service.reserve(this.abort.signal); }
+    catch (error) { error.code ||= 'WATCH_DECISION_FORMAT'; throw error; }
     this.phase = 'profile'; this.save({ phase: this.phase, pendingRequests: 0 });
-    let current = await this.execute('douyin_open_user', { secUid });
-    let state = current.state || current;
-    for (let attempt = 0; attempt < 12 && state.pageKind === 'user-profile' && !(state.userProfile?.works?.length); attempt++) {
-      await this.delayImpl(500, this.abort.signal); this.assertAllowed();
-      current = await this.execute('douyin_status'); state = current.state || current;
+    let current, state, visited = false, openFailure = null;
+    try {
+      current = await this.execute('douyin_open_user', { secUid });
+      state = current.state || current;
+      for (let attempt = 0; attempt < 12 && state.pageKind === 'user-profile' && !(state.userProfile?.works?.length); attempt++) {
+        await this.delayImpl(500, this.abort.signal); this.assertAllowed();
+        current = await this.execute('douyin_status'); state = current.state || current;
+      }
+      if (state.pageKind !== 'user-profile' || !state.userProfile || state.userProfile.secUid !== secUid) throw failure('打开作者主页后没有读到可核对的主页资料，已停止自主观看。', 'needs_user');
+      visited = true;
+    } catch (error) { openFailure = error; }
+    try { await service.settle(reservationId, { visited }); }
+    catch (error) {
+      if (openFailure) { openFailure.settleError = error.message; throw openFailure; }
+      throw failure(`查看主页计数结算失败：${error.message}`, 'needs_user');
     }
-    if (state.pageKind !== 'user-profile' || !state.userProfile || state.userProfile.secUid !== secUid) throw failure('打开作者主页后没有读到可核对的主页资料，已停止自主观看。', 'needs_user');
-    service.record();
+    if (openFailure) throw openFailure;
     const profile = state.userProfile;
     this.onEvent({ type: 'watch.profile', secUid, nickname: profile.nickname, workCount: profile.works.length, remaining: service.state().remaining });
     const dmContext = await this.dmContext();

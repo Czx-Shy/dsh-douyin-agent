@@ -51,12 +51,14 @@ test('发行白名单排除本机状态、维护工具和桌面资源，保留�
   for (const entry of manifest.files) {
     assert.ok(!/[?*\[\]\\]/.test(entry), `发行白名单不得使用运行文件通配符：${entry}`);
     assert.ok(!entry.startsWith('/') && !entry.includes('..'), '发行白名单只能使用包内路径');
-    assert.ok(!/^(?:desktop|tests|verification|state|node_modules|public)(?:\/|$)/.test(entry), `发行包不应包含开发或个人目录：${entry}`);
+    assert.ok(!/^(?:desktop|tests|verification|state|node_modules)(?:\/|$)/.test(entry), `发行包不应包含开发或个人目录：${entry}`);
     assert.ok(!/(?:^|\/)(?:\.env(?:\.|$)|\.cache|\.models|\.venv|settings\.local\.json|runtime-location\.json)|(?:hotload|plugin-install|install-native|probe|mcp-options)/i.test(entry), `发行包不应包含本机配置或维护工具：${entry}`);
     if (entry.endsWith('/')) assert.equal(entry, 'docs/', '只有公开说明目录允许整体包含');
     else assert.ok((await fs.stat(path.join(root, entry))).isFile(), `发行文件不存在：${entry}`);
   }
-  for (const relative of ['LICENSE', 'README.md', 'THIRD_PARTY_NOTICES.md', 'skill/SKILL.md']) assert.ok(included(relative));
+  // app.mjs 默认读取 public/index.html，两者都必须在发行包内并真实存在。
+  for (const relative of ['LICENSE', 'README.md', 'THIRD_PARTY_NOTICES.md', 'skill/SKILL.md', 'app.mjs', 'public/index.html']) assert.ok(included(relative), `发行包缺少运行入口：${relative}`);
+  assert.ok((await fs.stat(path.join(root, 'public/index.html'))).isFile(), '发行包缺少 public/index.html');
 });
 
 test('发行包保留可选音频运行入口和全部固定来源文件及原始许可', async () => {

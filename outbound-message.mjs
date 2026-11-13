@@ -7,10 +7,23 @@ import { OutboundCoordinator } from './outbound-send.mjs';
 const DEFAULTS = Object.freeze({ enabled: false, dailyLimit: 5, minIntervalSeconds: 30, autoFollow: true, dmPrompt: '' });
 const PROMPT_MAX = 1000;
 const RESERVATION_TTL_MS = 15 * 60 * 1000;
+const SEC_UID_PATTERN = /^[A-Za-z0-9_-]{4,64}$/;
+// 只接受抖音自己的域名，导航前就挡掉第三方地址。
+const DOUYIN_USER_HOSTS = new Set(['www.douyin.com', 'douyin.com']);
 const dayKey = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
 const fail = (message, status = 400) => Object.assign(new Error(message), { status });
 const read = (file, fallback) => { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (error) { if (error.code === 'ENOENT') return fallback; throw fail(`主动私信设置文件损坏：${error.message}`, 500); } };
 const write = (file, value) => { const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`; try { fs.writeFileSync(temporary, JSON.stringify(value, null, 2), { mode: 0o600, flag: 'wx' }); fs.renameSync(temporary, file); } finally { if (fs.existsSync(temporary)) fs.unlinkSync(temporary); } };
+
+// 解析作者主页地址：必须是抖音域名下的 /user/<secUid>。
+function parseUserUrl(value) {
+  let parsed;
+  try { parsed = new URL(String(value)); } catch { throw fail('作者主页地址不是有效网址，未发送。', 400); }
+  if (parsed.protocol !== 'https:' || !DOUYIN_USER_HOSTS.has(parsed.hostname.toLowerCase())) throw fail('只允许打开抖音域名下的作者主页，未发送。', 400);
+  const match = /^\/user\/([A-Za-z0-9_-]{4,64})\/?$/.exec(parsed.pathname);
+  if (!match) throw fail('作者主页地址必须是 /user/<secUid> 形式，未发送。', 400);
+  return match[1];
+}
 
 function validatePolicy(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw fail('主动私信设置必须是对象。');
@@ -138,8 +151,29 @@ export class OutboundMessageService {
   async _withReservation(callback, targetSecUid, signal) {
     const reservationId = await this._reserve(targetSecUid, signal);
     let clicked = false;
-    try { return await callback(() => { clicked = true; }); }
-    finally { await this._settle(reservationId, { sent: clicked }).catch(() => {}); }
+    let result, failure;
+    try { result = await callback(() => { clicked = true; }); }
+    catch (error) { failure = error; }
+    let settleError = null;
+    try { await this._settle(reservationId, { sent: clicked }); }
+    catch (error) {
+      settleError = error;
+      // 结算失败必须留下可核对的痕迹：预留仍在账本里，收据标记为待恢复。
+      this._appendSettlePending({ reservationId, targetSecUid, sent: clicked, reason: error.message });
+    }
+    if (failure) {
+      if (settleError) failure.settleError = settleError.message;
+      throw failure;
+    }
+    if (settleError) throw fail(`私信已点击发送，但额度结算失败：${settleError.message}。已记录待恢复，请核对抖音会话后再试。`, 500);
+    return result;
+  }
+
+  // 结算失败时的持久记录；收据也写不进去时仍然由调用方抛出结算异常，不静默。
+  _appendSettlePending({ reservationId, targetSecUid, sent, reason }) {
+    try {
+      this._appendReceipt({ id: `settle-${reservationId}`, at: new Date().toISOString(), targetSecUid, status: 'settle-pending', sent, reason });
+    } catch { /* 保留结算异常，交由 _withReservation 向上抛出 */ }
   }
 
   // 收据按行追加；只取最近 24 小时内、带目标身份且可解析的记录。
@@ -164,19 +198,22 @@ export class OutboundMessageService {
   _assertNoPendingTarget(targetSecUid, now = Date.now()) {
     const items = this._receipts(now - 24 * 60 * 60 * 1000).filter(item => item.targetSecUid === targetSecUid);
     const finished = new Set(items.filter(item => ['confirmed', 'uncertain', 'requires-follow', 'not-sent'].includes(item.status)).map(item => item.id));
-    const pending = items.find(item => item.status === 'uncertain' || (item.status === 'clicking' && !finished.has(item.id)));
+    const pending = items.find(item => item.status === 'uncertain' || item.status === 'settle-pending' || (item.status === 'clicking' && !finished.has(item.id)));
     if (pending) throw fail('这位作者上次私信的结果未确认，为避免重复发送已暂停；请在抖音核对会话后再试。', 409);
   }
 
   // 主流程：核对目标身份 → 导航到主页 → 点发消息 → 自动关注（如需）→ 填写发送 → 回读验证
   async sendToUser({ secUid, url, message }, { signal } = {}) {
     // 目标 secUid 只从明确入参或主页地址解析；两者冲突时拒绝发送。
-    const readSecUid = value => typeof value === 'string' && /^[A-Za-z0-9_-]{4,64}$/.test(value) ? value : null;
-    const urlSecUid = /\/user\/([A-Za-z0-9_-]{4,64})(?:[/?#]|$)/.exec(String(url || ''))?.[1] ?? null;
-    const targetSecUid = readSecUid(secUid) || urlSecUid;
+    const readSecUid = value => typeof value === 'string' && SEC_UID_PATTERN.test(value) ? value : null;
+    // 导航前先核对域名和路径，第三方地址不会进入浏览器。
+    const urlTarget = url === undefined || url === null || String(url).trim() === '' ? null : parseUserUrl(url);
+    const explicitSecUid = readSecUid(secUid);
+    const targetSecUid = explicitSecUid || urlTarget;
     if (!targetSecUid) throw fail('需要明确的作者主页地址或 secUid，未发送。', 400);
-    if (readSecUid(secUid) && urlSecUid && readSecUid(secUid) !== urlSecUid) throw fail('secUid 与主页地址不一致，未发送。', 400);
-    const userUrl = url || `https://www.douyin.com/user/${targetSecUid}`;
+    if (explicitSecUid && urlTarget && explicitSecUid !== urlTarget) throw fail('secUid 与主页地址不一致，未发送。', 400);
+    // 统一用规范地址导航，忽略传入地址里的查询串和大小写变体。
+    const userUrl = `https://www.douyin.com/user/${targetSecUid}`;
     return this._withReservation(markClicked => this._sendToUser({ targetSecUid, userUrl, message }, { signal, markClicked }), targetSecUid, signal);
   }
 
@@ -271,6 +308,13 @@ export class OutboundMessageService {
     // 发送按钮是带 e2e-send-msg-btn 类的 svg
     const sendButton = page.locator('[data-e2e="im-dialog"] .e2e-send-msg-btn').first();
     if (await sendButton.count() !== 1) throw fail('未找到唯一的发送按钮，未发送。', 500);
+
+    // 点击前再次核对页面归属与草稿，避免异步等待期间页面被替换或切换会话。
+    const finalState = await this.controller.state({ record: false });
+    const finalPath = String(page.url()).split('?')[0].split('#')[0].replace(/\/+$/, '');
+    if (finalState.loginRequired || finalState.verificationRequired) throw fail('点击前出现登录或安全验证要求，未发送。', 403);
+    if (finalState.pageKind !== 'user-profile' || finalState.userProfile?.secUid !== targetSecUid || finalPath !== `/user/${targetSecUid}`) throw fail('点击前页面已离开目标作者主页，未发送。', 409);
+    if (await readEditor() !== message.trim()) throw fail('点击前草稿内容已变化，未发送。', 409);
 
     // 点击前先落盘“正在发送”，进程在点击后中断也能在下次识别为结果不明。
     this._appendReceipt({ id: receiptId, at: startedAt, secUid: targetSecUid, targetSecUid, url: userUrl, nickname, messagePreview: message.slice(0, 80), status: 'clicking' });

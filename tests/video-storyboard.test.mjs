@@ -91,7 +91,7 @@ test('原生工具把实际分镜图片交给附件服务，保护画面不入�
   assert.throws(()=>validateToolArguments(zoom,{sampleId:'x',cell:17,videoId:ID}));
 });
 
-test('源码与桌面运行包都包含分镜适配、上游许可、JPEG许可及来源记录',()=>{
+test('源码与桌面运行包都包含分镜适配、上游许可、JPEG许可及来源记录',{skip:fs.existsSync(new URL('../desktop/scripts/stage-api-runtime.mjs',import.meta.url))?false:'当前目录缺少 desktop/（仅源码仓库提供），跳过桌面发行校验。'},()=>{
   const pkg=JSON.parse(fs.readFileSync(new URL('../package.json',import.meta.url),'utf8'));
   for(const file of ['video-storyboard.mjs','storyboard/PROVENANCE.json','storyboard/vendor/sheet.mjs','storyboard/vendor/plan.mjs','storyboard/vendor/LICENSE','storyboard/vendor/NOTICE','storyboard/vendor/jpeg-js/index.js','storyboard/vendor/jpeg-js/lib/encoder.js','storyboard/vendor/jpeg-js/lib/decoder.js','storyboard/vendor/jpeg-js/LICENSE','storyboard/vendor/jpeg-js/LICENSE-APACHE-2.0.txt'])assert.ok(pkg.files.includes(file),file);
   const stage=fs.readFileSync(new URL('../desktop/scripts/stage-api-runtime.mjs',import.meta.url),'utf8');

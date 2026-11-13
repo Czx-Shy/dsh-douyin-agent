@@ -12,10 +12,11 @@ const lockInitializationGraceMs = 500;
 
 // 三种发送共用同一把本机锁；账本只保存可核对的发出凭据，不保存正文。
 export class OutboundCoordinator {
-  constructor({ stateDir = resolveRuntimePaths().stateDir, source = 'api', now = Date.now, waitMs = 5000 } = {}) {
+  constructor({ stateDir = resolveRuntimePaths().stateDir, source = 'api', now = Date.now, waitMs = 5000, guardFile = 'outbound-send.guard' } = {}) {
     if (!['api', 'dsh'].includes(source) || typeof now !== 'function' || !Number.isSafeInteger(waitMs) || waitMs < 0 || waitMs > 30_000) throw new TypeError('发出消息协调器的入口、时钟或等待预算不正确。');
+    if (typeof guardFile !== 'string' || !/^[a-z0-9-]+\.guard$/.test(guardFile)) throw new TypeError('发出消息协调器的锁文件名不正确。');
     Object.assign(this, { stateDir, source, now, waitMs });
-    this.guardFile = path.join(stateDir, 'outbound-send.guard');
+    this.guardFile = path.join(stateDir, guardFile);
     this.receiptsFile = path.join(stateDir, 'outbound-receipts.json');
   }
   ledger() {

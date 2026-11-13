@@ -2,10 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import vm from 'node:vm';
-import { operationLabel, requestFailure } from '../desktop/ui-api/src/api.mjs';
-
-const software = await fs.readFile(new URL('../desktop/ui-api/src/main.jsx', import.meta.url), 'utf8');
+const desktopApi = await import('../desktop/ui-api/src/api.mjs').catch(() => null);
+const { operationLabel, requestFailure } = desktopApi ?? {};
+// desktop/ 只随源码仓库提供，发行包里没有；缺失时明确跳过而不是报模块不存在。
+const desktopSkip = desktopApi ? false : '当前目录缺少 desktop/（仅源码仓库提供），跳过桌面 UI 校验。';
+const software = desktopSkip ? '' : await fs.readFile(new URL('../desktop/ui-api/src/main.jsx', import.meta.url), 'utf8');
 const native = await fs.readFile(new URL('../client.js', import.meta.url), 'utf8');
+const desktopTest = (name, fn) => test(name, { skip: desktopSkip }, fn);
 function between(source, start, end) {
   const from=source.indexOf(start),to=source.indexOf(end,from); assert.ok(from>=0&&to>from); return source.slice(from,to);
 }
@@ -15,7 +18,7 @@ function nativeTransport() {
   return definition.factory(name=>name==='react'?{}:{Button(){}}).createSettingsTransport;
 }
 
-test('插件传输将超时标明操作，不回显查询和凭据，也不重放写入',async()=>{
+desktopTest('插件传输将超时标明操作，不回显查询和凭据，也不重放写入',async()=>{
   const create=nativeTransport(),calls=[]; let mode='ok';
   const api=create({location:{protocol:'dsh-app:',hostname:'app'},fetch:async(route)=>{
     calls.push(route);
@@ -35,7 +38,7 @@ test('插件传输将超时标明操作，不回显查询和凭据，也不重�
   assert.equal(writes,1);pending.resolve({ok:true,json:async()=>({policy:{enabled:true}})});await first;
 });
 
-for(const [label,source,isNative] of [['软件',software,false],['插件',native,true]])test(`${label}同操作忙时不重复提交，其他操作成功不抹掉已发生的业务错误`,async()=>{
+for(const [label,source,isNative] of [['软件',software,false],['插件',native,true]])desktopTest(`${label}同操作忙时不重复提交，其他操作成功不抹掉已发生的业务错误`,async()=>{
   const gate=Promise.withResolvers(),locks={current:new Set()},alive={current:true};let calls=0,errors={};
   const setOperationErrors=update=>{errors=update(errors);};
   let perform;
@@ -54,7 +57,7 @@ for(const [label,source,isNative] of [['软件',software,false],['插件',native
   await perform('chatList',async()=>{});assert.equal(errors.chatList,undefined,'同一操作成功后清掉自己的旧错误');
 });
 
-test('软件轮询子请求失败会显示来源并撤下旧在线快照，读回成功后只清相应状态错误',async()=>{
+desktopTest('软件轮询子请求失败会显示来源并撤下旧在线快照，读回成功后只清相应状态错误',async()=>{
   const code=between(software,'    let alive = true, polling = false, ticks = 0;','    pollRef.current = poll;');
   let failing=true,pollError='',interactions={presence:{label:'旧在线'}},connected=false;
   const names=['client','bootRef','bridge','revision','currentTask','setEvents','setWatchSynced','setBoot','setSettings','publicSettings','setConnected','setConnectionError','setRunning','submitLock','setTasks','restoredSelection','setSelectedTask','mergeEvents','setBrowser','setSchedule','setInteractions','setVideo','setTaskLimits','setMode','setComments','setChat','setAudio','setWatch','setShare','setPersona','setPollError'];

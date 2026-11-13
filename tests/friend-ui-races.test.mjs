@@ -1,12 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { matchesAuthorizedContact } from '../contact-authorization.mjs';
 
+const desktopFile = name => new URL(`../desktop/ui-api/src/${name}`, import.meta.url);
+// desktop/ 只随源码仓库提供，发行包里没有；缺失时只跳过依赖它的用例。
+const desktopSkip = existsSync(desktopFile('main.jsx')) ? false : '当前目录缺少 desktop/（仅源码仓库提供），跳过桌面 UI 校验。';
 const native = await fs.readFile(new URL('../client.js', import.meta.url), 'utf8');
-const software = await fs.readFile(new URL('../desktop/ui-api/src/main.jsx', import.meta.url), 'utf8');
-const hookSource = await fs.readFile(new URL('../desktop/ui-api/src/use-auto-save.jsx', import.meta.url), 'utf8');
+const software = desktopSkip ? '' : await fs.readFile(desktopFile('main.jsx'), 'utf8');
+const hookSource = desktopSkip ? '' : await fs.readFile(desktopFile('use-auto-save.jsx'), 'utf8');
 function extract(source, startText, endText) {
   const start = source.indexOf(startText), end = source.indexOf(endText, start); assert.ok(start >= 0 && end > start);
   return source.slice(start, end).trim().replace(/^export /, '');
@@ -23,10 +27,10 @@ test('原生fresh刷新合并为单飞请求，不应用需要重读的旧快照
   assert.equal((await refresh(true)).sequence, 3, '没有现成轮询时，恢复按钮仍可拿到最新快照');
 });
 
-for (const [label, source, startText, endText] of [
-  ['软件', hookSource, 'export function useAutoSave(', '\nexport function AutoSaveStatus'],
-  ['插件', native, '    function useAutosave(', '\n    function SettingsPage'],
-]) test(`${label}旧勾选queued不能越过新的昵称blur草稿，离开后才写完整值`, async () => {
+for (const [label, source, startText, endText, skip] of [
+  ['软件', hookSource, 'export function useAutoSave(', '\nexport function AutoSaveStatus', desktopSkip],
+  ['插件', native, '    function useAutosave(', '\n    function SettingsPage', false],
+]) test(`${label}旧勾选queued不能越过新的昵称blur草稿，离开后才写完整值`, { skip }, async () => {
   const code = extract(source, startText, endText), first = Promise.withResolvers(), entered = Promise.withResolvers(), calls = [];
   // 直接执行产品hook的闭包与真实定时器；此处不假称浏览器或真实联系人联调。
   const hook = new Function('useState', 'useRef', 'useEffect', `return (${code});`)(initial => [typeof initial === 'function' ? initial() : initial, () => {}], value => ({ current: value }), effect => { effect(); });
@@ -48,7 +52,7 @@ test('两端名单去掉身份旁注，授权仍由稳定身份核对', () => {
   assert.equal(matchesAuthorizedContact(saved, { ...current, identityBinding: `binding:${'d'.repeat(64)}` }), false);
 });
 
-test('软件状态栏直接渲染后端presence；断连不继续显示旧在线，attention展示原因', async () => {
+test('软件状态栏直接渲染后端presence；断连不继续显示旧在线，attention展示原因', { skip: desktopSkip }, async () => {
   const require = createRequire(new URL('../desktop/ui-api/package.json', import.meta.url)), desktopRequire = createRequire(new URL('../desktop/package.json', import.meta.url));
   const React = require('react'), { renderToStaticMarkup } = require('react-dom/server');
   const code = extract(software, 'function FriendPresence(', '\nfunction ReviewDialog');

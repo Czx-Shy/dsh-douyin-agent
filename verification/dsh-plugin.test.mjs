@@ -6,8 +6,13 @@ import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { TOOL_DEFINITIONS, validateToolArguments } from '../tool-definitions.mjs';
 import { apply, createNativeToolDefinitions } from '../dsh-plugin.mjs';
-import { BEGIN_MARKER, END_MARKER, managePlugin, planPatch } from '../plugin-install.mjs';
+import { dshNodeModules, dshSkipReason, nativeTest } from './sdk.mjs';
 import { bindNativePersonaContext } from '../native-persona-context.mjs';
+
+// plugin-install.mjs 只随源码仓库提供，发行包里没有；缺失时只跳过安装器相关用例。
+const install = await import('../plugin-install.mjs').catch(() => null);
+const { BEGIN_MARKER, END_MARKER, managePlugin, planPatch } = install ?? {};
+const installTest = (name, fn) => test(name, { skip: install ? dshSkipReason : '当前目录缺少 plugin-install.mjs（仅源码仓库提供），跳过安装器验收。' }, fn);
 
 const isolatedRoot = await mkdtemp(join(tmpdir(), 'douyin-sdk-isolated-'));
 process.env.DOUYIN_RUNTIME_LOCATION_FILE = join(isolatedRoot, 'absent-location.json');
@@ -17,18 +22,18 @@ process.env.DOUYIN_MEDIA_ENV_FILE = join(isolatedRoot, 'media.env');
 process.env.DOUYIN_MEDIA_SETTINGS_FILE = join(isolatedRoot, 'media.json');
 test.after(async()=>{assert.equal(dirname(resolve(isolatedRoot)),resolve(tmpdir()));await rm(isolatedRoot,{recursive:true,force:true});});
 
-const dshModules = process.env.DSH_NODE_MODULES || 'F:/codex/DSH Desktop 2/resources/app/node_modules';
 // 这里加载电脑上 DSH 正在使用的实现，不以自写 schema 校验器替代原生接口。
-const [{ ToolRuntime, assertObjectJsonSchema, assertSupportedJsonSchema }, { Context }, { default: Loader }, { LocalAttachmentStore }, { default: sharp }, { DynamicCordisRunnerService }, { default: Include }, { SystemPrompt, renderContextSnapshot }] = await Promise.all([
-  import(pathToFileURL(join(dshModules, '@deepseek-ai/dsh-tools/lib/index.js')).href),
-  import(pathToFileURL(join(dshModules, '@deepseek-ai/cordis/lib/index.js')).href),
-  import(pathToFileURL(join(dshModules, '@deepseek-ai/cordis-plugin-loader/lib/index.js')).href),
-  import(pathToFileURL(join(dshModules, '@deepseek-ai/dsh-attachment-local/lib/index.js')).href),
-  import(pathToFileURL(join(dshModules, 'sharp/dist/index.cjs')).href),
-  import(pathToFileURL(join(dshModules, '@deepseek-ai/dsh-cordis-host-runner/lib/index.js')).href),
-  import(pathToFileURL(join(dshModules, '@deepseek-ai/cordis-plugin-include/lib/index.js')).href),
-  import(pathToFileURL(join(dshModules, '@deepseek-ai/dsh-system-prompt/lib/index.js')).href),
-]);
+const sdkModules = dshNodeModules ? await Promise.all([
+  import(pathToFileURL(join(dshNodeModules, '@deepseek-ai/dsh-tools/lib/index.js')).href),
+  import(pathToFileURL(join(dshNodeModules, '@deepseek-ai/cordis/lib/index.js')).href),
+  import(pathToFileURL(join(dshNodeModules, '@deepseek-ai/cordis-plugin-loader/lib/index.js')).href),
+  import(pathToFileURL(join(dshNodeModules, '@deepseek-ai/dsh-attachment-local/lib/index.js')).href),
+  import(pathToFileURL(join(dshNodeModules, 'sharp/dist/index.cjs')).href),
+  import(pathToFileURL(join(dshNodeModules, '@deepseek-ai/dsh-cordis-host-runner/lib/index.js')).href),
+  import(pathToFileURL(join(dshNodeModules, '@deepseek-ai/cordis-plugin-include/lib/index.js')).href),
+  import(pathToFileURL(join(dshNodeModules, '@deepseek-ai/dsh-system-prompt/lib/index.js')).href),
+]) : [];
+const [{ ToolRuntime, assertObjectJsonSchema, assertSupportedJsonSchema } = {}, { Context } = {}, { default: Loader } = {}, { LocalAttachmentStore } = {}, { default: sharp } = {}, { DynamicCordisRunnerService } = {}, { default: Include } = {}, { SystemPrompt, renderContextSnapshot } = {}] = sdkModules;
 
 function context() {
   const ctx = new Context();
@@ -86,7 +91,7 @@ export function apply(ctx,config={}){
   };
 }
 
-test('真实SDK复现：旧式include移除再新建留下失败条目，Loader.await不能代替完整性验收', async () => {
+nativeTest('真实SDK复现：旧式include移除再新建留下失败条目，Loader.await不能代替完整性验收', async () => {
   const fixture = await managedIncludeFixture();
   try {
     assert.equal(fixture.runtime.schemas().length, 17);
@@ -103,7 +108,7 @@ test('真实SDK复现：旧式include移除再新建留下失败条目，Loader.
   } finally { await fixture.close(); }
 });
 
-test('真实SDK复现：Loader仅更新name元数据时旧fiber和17工具仍在', async () => {
+nativeTest('真实SDK复现：Loader仅更新name元数据时旧fiber和17工具仍在', async () => {
   const fixture = await managedIncludeFixture();
   try {
     await fixture.ctx.loader.update(fixture.entry.id, { name: `${fixture.uri}?v=18` });
@@ -115,7 +120,7 @@ test('真实SDK复现：Loader仅更新name元数据时旧fiber和17工具仍在
   } finally { await fixture.close(); }
 });
 
-test('旧版完整32工具被误标为v15时仍核对实际入口函数，真实重载后重复运行不再重启', async () => {
+nativeTest('旧版完整32工具被误标为v15时仍核对实际入口函数，真实重载后重复运行不再重启', async () => {
   for (const version of ['4-full', '7-full']) {
     const fixture = await managedIncludeFixture({ version });
     try {
@@ -144,7 +149,7 @@ test('旧版完整32工具被误标为v15时仍核对实际入口函数，真实
   }
 });
 
-test('真实纯host沙箱受控重启原include条目，停止辅助包仍保留完整工具与其他配置', async () => {
+nativeTest('真实纯host沙箱受控重启原include条目，停止辅助包仍保留完整工具与其他配置', async () => {
   const fixture = await managedIncludeFixture();
   try {
     const before = structuredClone(fixture.entry.options);
@@ -171,7 +176,7 @@ test('真实纯host沙箱受控重启原include条目，停止辅助包仍保留
   } finally { await fixture.close(); }
 });
 
-test('已有完整目录或v5旧22工具仍核对自有entry版本，升级到v15且重复运行不重启', async () => {
+nativeTest('已有完整目录或v5旧22工具仍核对自有entry版本，升级到v15且重复运行不重启', async () => {
   for (const version of ['4-full', '5']) {
   const fixture = await managedIncludeFixture({ version });
   try {
@@ -191,7 +196,7 @@ test('已有完整目录或v5旧22工具仍核对自有entry版本，升级到v1
   }
 });
 
-test('原位升级的应用失败或工具目录不完整时回滚原include条目和配置', async () => {
+nativeTest('原位升级的应用失败或工具目录不完整时回滚原include条目和配置', async () => {
   for (const mode of ['throw', 'incomplete']) {
     const fixture = await managedIncludeFixture({ mode });
     try {
@@ -211,7 +216,7 @@ test('原位升级的应用失败或工具目录不完整时回滚原include条�
   }
 });
 
-test('工具名齐全但来源不是目标entry，或自有entry不唯一时拒绝加载', async () => {
+nativeTest('工具名齐全但来源不是目标entry，或自有entry不唯一时拒绝加载', async () => {
   const foreign = await managedIncludeFixture({ version: '18' });
   try {
     const body = (await foreign.helper()).replaceAll(foreign.uri, foreign.uri.replace('plugin.mjs', 'different-plugin.mjs'));
@@ -231,7 +236,7 @@ test('工具名齐全但来源不是目标entry，或自有entry不唯一时拒�
   } finally { await ambiguous.close(); }
 });
 
-test('停用或等待注入依赖的自有v8条目，不因外部完整工具齐全而被误报为活动插件', async () => {
+nativeTest('停用或等待注入依赖的自有v8条目，不因外部完整工具齐全而被误报为活动插件', async () => {
   for (const inactive of ['disabled', 'waiting']) {
     const fixture = await managedIncludeFixture({ version: '8' });
     const disposers = [];
@@ -262,7 +267,7 @@ test('停用或等待注入依赖的自有v8条目，不因外部完整工具齐
   }
 });
 
-test('新建条目的清理不删除同ID替换、原位改名的其他插件，条目已移除时保持幂等', async () => {
+nativeTest('新建条目的清理不删除同ID替换、原位改名的其他插件，条目已移除时保持幂等', async () => {
   for (const replacement of ['replace', 'rename', 'removed']) {
     const directory = await mkdtemp(join(tmpdir(), 'douyin-cleanup-owner-'));
     const file = join(directory, 'plugin.mjs'), uri = pathToFileURL(file).href;
@@ -307,7 +312,7 @@ test('新建条目的清理不删除同ID替换、原位改名的其他插件，
   }
 });
 
-test('完整工具目录使用真实 DSH schema、注册表和执行管线', async () => {
+nativeTest('完整工具目录使用真实 DSH schema、注册表和执行管线', async () => {
   const { ctx, runtime } = context();
   const calls = [];
   const definitions = createNativeToolDefinitions({ ctx, getController: async () => ({ execute: async (name, args, options) => { calls.push({ name, args, options }); return { ok: true, state: { name, sample: true } }; } }) });
@@ -328,7 +333,7 @@ test('完整工具目录使用真实 DSH schema、注册表和执行管线', asy
   } finally { for (const dispose of disposers.reverse()) dispose(); }
 });
 
-test('自主观看原生工具注入服务时走共享watch，默认只使用现有轮次，不回落浏览器执行', async () => {
+nativeTest('自主观看原生工具注入服务时走共享watch，默认只使用现有轮次，不回落浏览器执行', async () => {
   const { ctx, runtime } = context();
   const calls = [], lookups = [];
   const watch = {
@@ -359,7 +364,7 @@ test('自主观看原生工具注入服务时走共享watch，默认只使用现
   } finally { for (const dispose of disposers.reverse()) dispose(); await ctx.fiber.dispose(); }
 });
 
-test('共享人格绑定可使用已装真实SystemPrompt变量与动态上下文，每次组装刷新且卸载释放', async () => {
+nativeTest('共享人格绑定可使用已装真实SystemPrompt变量与动态上下文，每次组装刷新且卸载释放', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'douyin-native-persona-sdk-'));
   const ctx = new Context(), prompt = new SystemPrompt(ctx, { includeHarnessIdentity: false });
   let current = '合成人格版本一：喜欢清楚的解释。';
@@ -387,7 +392,7 @@ test('共享人格绑定可使用已装真实SystemPrompt变量与动态上下�
   }
 });
 
-test('无效参数和控制器失败进入真实 ToolRuntime 的 isError 结果', async () => {
+nativeTest('无效参数和控制器失败进入真实 ToolRuntime 的 isError 结果', async () => {
   const { ctx, runtime } = context();
   const definitions = createNativeToolDefinitions({ ctx, getController: async () => ({ execute: async () => ({ ok: false, error: '验证失败' }) }) });
   const disposers = definitions.map((definition) => runtime.register(definition));
@@ -402,7 +407,7 @@ test('无效参数和控制器失败进入真实 ToolRuntime 的 isError 结果'
   } finally { for (const dispose of disposers.reverse()) dispose(); }
 });
 
-test('已取消调用不进入控制器', async () => {
+nativeTest('已取消调用不进入控制器', async () => {
   const { ctx, runtime } = context();
   let count = 0;
   const definition = createNativeToolDefinitions({ ctx, getController: async () => ({ execute: async () => { count += 1; return {}; } }) })[0];
@@ -416,7 +421,7 @@ test('已取消调用不进入控制器', async () => {
   } finally { dispose(); }
 });
 
-test('原生插件仅注册工具，不触碰工作区且加载时不创建浏览器', async () => {
+nativeTest('原生插件仅注册工具，不触碰工作区且加载时不创建浏览器', async () => {
   const registered = [];
   let teardown;
   const ctx = { tools: { register(value) { registered.push(value); return () => {}; } }, effect(value) { teardown = value(); } };
@@ -428,7 +433,7 @@ test('原生插件仅注册工具，不触碰工作区且加载时不创建浏�
   await assert.rejects(registered[0].execute({}), /已卸载/);
 });
 
-test('真实 Cordis Loader 可加载本地 file URI 并释放完整工具目录', async () => {
+nativeTest('真实 Cordis Loader 可加载本地 file URI 并释放完整工具目录', async () => {
   const { ctx, runtime } = context();
   const loaderFiber = ctx.plugin(Loader, { baseUrl: pathToFileURL(join(dshModules, '..', 'cordis.yml')).href });
   await loaderFiber.await();
@@ -444,14 +449,14 @@ test('真实 Cordis Loader 可加载本地 file URI 并释放完整工具目录'
   } finally { await ctx.fiber.dispose(); }
 });
 
-test('注册中途失败会释放已注册工具', async () => {
+nativeTest('注册中途失败会释放已注册工具', async () => {
   let count = 0;
   let disposed = 0;
   await assert.rejects(apply({ tools: { register() { count += 1; if (count === 3) throw new Error('注册冲突'); return () => { disposed += 1; }; } } }), /注册冲突/);
   assert.equal(disposed, 2);
 });
 
-test('真实动态包沙箱通过 Loader 热加载原生插件并可停止释放', async () => {
+nativeTest('真实动态包沙箱通过 Loader 热加载原生插件并可停止释放', async () => {
   const { ctx, runtime } = context();
   const loaderFiber = ctx.plugin(Loader, { baseUrl: pathToFileURL(join(dshModules, '..', 'cordis.yml')).href });
   await loaderFiber.await();
@@ -471,7 +476,7 @@ test('真实动态包沙箱通过 Loader 热加载原生插件并可停止释放
   } finally { await ctx.fiber.dispose(); }
 });
 
-test('真实动态包可通过 Loader 原位升级同路径旧模块，保留已有entry归属', async () => {
+nativeTest('真实动态包可通过 Loader 原位升级同路径旧模块，保留已有entry归属', async () => {
   const directory=await mkdtemp(join(tmpdir(),'douyin-upgrade-'));
   const file=join(directory,'plugin.mjs'),uri=pathToFileURL(file).href;
   const {ctx,runtime}=context();
@@ -494,7 +499,7 @@ test('真实动态包可通过 Loader 原位升级同路径旧模块，保留已
   }finally{await ctx.fiber.dispose();await rm(directory,{recursive:true,force:true});}
 });
 
-test('真实原生聊天增量包与已有视频工具共存，不重复注册或卸载视频工具',async()=>{
+nativeTest('真实原生聊天增量包与已有视频工具共存，不重复注册或卸载视频工具',async()=>{
   const {ctx,runtime}=context();
   const video=createNativeToolDefinitions({ctx,getController:async()=>({execute:async()=>({ok:true})})}).filter(tool=>!tool.name.startsWith('douyin_chat_'));
   const off=video.map(tool=>runtime.register(tool));
@@ -509,7 +514,7 @@ test('真实原生聊天增量包与已有视频工具共存，不重复注册�
   }finally{for(const dispose of off)dispose();await ctx.fiber.dispose();}
 });
 
-test('图片经 attachment ref 呈现，base64 不进入原生结果与文本', async () => {
+nativeTest('图片经 attachment ref 呈现，base64 不进入原生结果与文本', async () => {
   let saved;
   const refs = [{ attachmentId: 'sha256:' + 'a'.repeat(64), mediaType: 'image/png', bytes: 68, width: 1, height: 1 }];
   const ctx = { get(name) { return name === 'attachments' ? { saveImages: async (images) => { saved = images; return refs; } } : name === 'llm' ? { resolveModelInfo: async () => ({ inputModalities: ['text', 'image'] }) } : undefined; } };
@@ -527,7 +532,7 @@ test('图片经 attachment ref 呈现，base64 不进入原生结果与文本', 
   assert.equal(JSON.stringify(result).includes(pixel), false);
 });
 
-test('模型未声明支持图片时明确报告，不伪称已看懂画面', async () => {
+nativeTest('模型未声明支持图片时明确报告，不伪称已看懂画面', async () => {
   const ctx = { get(name) { return name === 'attachments' ? { saveImages: async () => { throw new Error('不应调用附件存储'); } } : name === 'llm' ? { resolveModelInfo: async () => ({ inputModalities: ['text'] }) } : undefined; } };
   const definition = createNativeToolDefinitions({ ctx, getController: async () => ({ execute: async () => ({ frames: [{ mimeType: 'image/png', data: pixel }] }) }) }).find((item) => item.name === 'douyin_screenshot');
   const value = await definition.execute({}, { agent: { options: { provider: '验证', model: '纯文本模型' } } });
@@ -536,7 +541,7 @@ test('模型未声明支持图片时明确报告，不伪称已看懂画面', as
   assert.equal(JSON.stringify(value).includes(pixel), false);
 });
 
-test('登录、验证或敏感画面不进入附件存储或原生文本', async () => {
+nativeTest('登录、验证或敏感画面不进入附件存储或原生文本', async () => {
   let stored = 0;
   const ctx = { get() { stored += 1; throw new Error('不得调用服务'); } };
   for (const state of [{ loginRequired: true }, { verificationRequired: true }, {}]) {
@@ -550,7 +555,7 @@ test('登录、验证或敏感画面不进入附件存储或原生文本', async
   assert.equal(stored, 0);
 });
 
-test('真实 DSH 附件存储接收图片并通过 ref 回读', async () => {
+nativeTest('真实 DSH 附件存储接收图片并通过 ref 回读', async () => {
   const temporaryRoot = await mkdtemp(join(tmpdir(), 'dsh-douyin-attachment-'));
   const ctx = new Context();
   const attachments = new LocalAttachmentStore(ctx, { dshHome: temporaryRoot });
@@ -573,14 +578,14 @@ test('真实 DSH 附件存储接收图片并通过 ref 回读', async () => {
   }
 });
 
-test('工具 schema 与执行验证共同限制长度和数值', () => {
+nativeTest('工具 schema 与执行验证共同限制长度和数值', () => {
   for (const [name, args] of [['douyin_search', { query: '猫'.repeat(301) }], ['douyin_recall', { query: '猫'.repeat(301) }], ['douyin_remember', { content: '猫'.repeat(4001) }], ['douyin_remember', { content: '偏好', kind: '猫'.repeat(41) }], ['douyin_observe', { seconds: 0 }], ['douyin_recall', { limit: 21 }], ['douyin_open_video', { index: -1 }]]) {
     assert.throws(() => validateToolArguments(TOOL_DEFINITIONS.find((item) => item.name === name), args));
   }
   assert.doesNotThrow(() => validateToolArguments(TOOL_DEFINITIONS.find((item) => item.name === 'douyin_search'), { query: '猫'.repeat(300) }));
 });
 
-test('共享安装可回读、幂等和卸载，并保留其他配置', async () => {
+installTest('共享安装可回读、幂等和卸载，并保留其他配置', async () => {
   const temporaryRoot = await mkdtemp(join(tmpdir(), 'dsh-douyin-plugin-'));
   try {
     const homeDir = join(temporaryRoot, '.dsh');
@@ -618,7 +623,7 @@ test('共享安装可回读、幂等和卸载，并保留其他配置', async ()
   }
 });
 
-test('损坏或重复的管理标记会停止改写', () => {
+installTest('损坏或重复的管理标记会停止改写', () => {
   assert.throws(() => planPatch(Buffer.from(BEGIN_MARKER)), /不完整或重复/);
   assert.throws(() => planPatch(Buffer.from(`${BEGIN_MARKER}\n${BEGIN_MARKER}\n${END_MARKER}`)), /不完整或重复/);
   assert.throws(() => planPatch(Buffer.from('- insert:\n    - id: douyin-browser\n      name: other-plugin\n')), /未由本安装器管理/);
