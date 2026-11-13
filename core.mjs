@@ -531,7 +531,9 @@ export function readPageState() {
       // 文本格式：[置顶]{点赞数}{标题}，点赞数可能是纯数字或带万/亿
       const rest = linkText.replace(/^置顶/, '');
       const likeAndTitle = /^([\d.]+)\s*(万|亿)?\s*(.+)$/.exec(rest);
-      const title = (likeAndTitle?.[3] || rest).slice(0, 200) || null;
+      // 作品卡片的无障碍文本会把标题重复一遍，等长前后半段相同时收敛为一份
+      const dedupe = text => text.length % 2 === 0 && text.slice(0, text.length / 2) === text.slice(text.length / 2) ? text.slice(0, text.length / 2) : text;
+      const title = dedupe((likeAndTitle?.[3] || rest).trim()).slice(0, 200) || null;
       const likeCount2 = likeAndTitle ? parseCount(likeAndTitle[1], likeAndTitle[2]) : null;
       works.push({ id, url: `https://www.douyin.com/${/\/note\//.test(anchor.href) ? 'note' : 'video'}/${id}`, title, likeCount: likeCount2 });
     }
