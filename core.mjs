@@ -518,9 +518,10 @@ export function readPageState() {
     const bioMatch = /IP属地[：:]\s*[^男女·\s]{2,4}(?:男|女)?[^·\s]{0,4}·?[^·\s]{2,4}\s*(.+?)(?:\.{2,}更多|更多|分享主页|互相关注|私信|下载电脑客户端|作品|$)/.exec(statsText);
     const bio = bioMatch?.[1]?.trim()?.slice(0, 500) || null;
     const verified = profileRoot.querySelector('[data-e2e="verify-badge"],[class*="verify-badge"],[class*="verified"]') !== null || /官方认证|企业认证|机构认证/.test(statsText);
-    // 作品列表：在整个文档中查找作品链接
+    // 作品列表：只取主页作品区，避免把页脚推荐或 SEO 链接误当成本人作品
     const works = [];
-    const workAnchors = [...document.querySelectorAll('a[href*="/video/"],a[href*="/note/"]')].filter(a => visible(a)).slice(0, 30);
+    const worksRoot = document.querySelector('[data-e2e="user-post-list"]');
+    const workAnchors = worksRoot ? [...worksRoot.querySelectorAll('a[href*="/video/"],a[href*="/note/"]')].filter(a => visible(a)).slice(0, 30) : [];
     const seenWorks = new Set();
     for (const anchor of workAnchors) {
       const id = workId(anchor.href);
