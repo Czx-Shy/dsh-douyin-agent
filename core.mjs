@@ -341,7 +341,19 @@ export function readPageState() {
     const playerId=/(?:^|\s)video_(\d+)(?:\s|$)/.exec(element.closest('[data-e2e="player-container"]')?.className??'')?.[1],activeId=/(?:^|\s)video_(\d+)(?:\s|$)/.exec(activeContainer?.className??'')?.[1];
     videoIdentityConflict=Boolean(playerId&&activeId&&playerId!==activeId);
     const id = videoIdentityConflict?null:playerId || activeId || links.map(e=>workId(e.href)).find(Boolean) || workId(location.href) || null;
-    const authorElement = links.find(e => /\/user\//.test(e.href)) || [...(container?.querySelectorAll('span,div')??[])].find(e=>e.childElementCount===0 && /^@/.test(clean(e.textContent)) && visible(e));
+    // 主页推荐流里的作者链接未必在作品容器内，退化为按距离找最近一个 @作者 链接
+    const nearestUserLink = () => {
+      const r0 = element.getBoundingClientRect();
+      let best = null, bestDistance = Infinity;
+      for (const link of document.querySelectorAll('a[href*="/user/"]')) {
+        if (!visible(link) || link.closest(privateArea) || !/^@/.test(clean(link.textContent))) continue;
+        const r = link.getBoundingClientRect();
+        const distance = Math.hypot((r.left + r.width / 2) - (r0.left + r0.width / 2), (r.top + r.height / 2) - (r0.top + r0.height / 2));
+        if (distance < bestDistance) { bestDistance = distance; best = link; }
+      }
+      return best;
+    };
+    const authorElement = links.find(e => /\/user\//.test(e.href)) || nearestUserLink() || [...(container?.querySelectorAll('span,div')??[])].find(e=>e.childElementCount===0 && /^@/.test(clean(e.textContent)) && visible(e));
     const authorSecUid = authorElement ? /\/user\/([A-Za-z0-9_-]+)/.exec(authorElement.getAttribute?.('href') || authorElement.href || '')?.[1] ?? null : null;
     const titleElement = container?.querySelector('[data-e2e="video-desc"],[data-e2e="video-title"],[data-e2e="detail-video-info"],[class*="video-info-detail"]');
     const detailAuthor=container?.querySelector('[data-e2e="related-video"]')?.innerText?.split('\n').map(clean).find(Boolean);

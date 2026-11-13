@@ -263,7 +263,12 @@ export class AutonomousWatch {
   async visitAuthor(observedState) {
     const service = await this.controller.getProfileViewService?.();
     if (!service) throw Object.assign(new Error('查看主页服务未加载，未打开主页。'), { code: 'WATCH_DECISION_FORMAT' });
-    const secUid = observedState.video?.authorSecUid;
+    let secUid = observedState.video?.authorSecUid;
+    if (!secUid && /^\d{10,30}$/.test(observedState.video?.id || '')) {
+      // 推荐流有时读不到作者链接，先打开作品详情页拿到作者，再进主页
+      const detail = await this.execute('douyin_open_video', { url: `https://www.douyin.com/video/${observedState.video.id}` }, { allowLoading: true });
+      secUid = (detail.state || detail)?.video?.authorSecUid || null;
+    }
     if (!secUid) throw Object.assign(new Error('当前作品没有可核对的作者主页地址，未打开主页。'), { code: 'WATCH_DECISION_FORMAT' });
     // 额度在锁内预留，主页读取成功后再结算，避免两个入口同时通过检查。
     let reservationId;
