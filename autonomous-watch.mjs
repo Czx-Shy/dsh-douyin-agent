@@ -14,6 +14,8 @@ import { UsageLedger } from './usage-ledger.mjs';
 import { BEHAVIOR_THRESHOLDS } from './persona-memory.mjs';
 
 export const WATCH_LIMITS = Object.freeze({ sampleSeconds: 3 });
+// 同一次运行内重复进入同一作者主页可连续观看的作品上限
+const PROFILE_SESSION_LIMIT = 5;
 const alive = pid => { if (!Number.isSafeInteger(pid) || pid < 1) return false; try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; } };
 const exited = pid => { if (!Number.isSafeInteger(pid) || pid < 1) return false; try { process.kill(pid, 0); return false; } catch (error) { return error.code === 'ESRCH'; } };
 const read = (file, fallback) => { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (error) { if (error.code === 'ENOENT') return fallback; throw new Error('自主观看状态文件损坏，未重置预算或运行锁。'); } };
@@ -248,7 +250,13 @@ export class AutonomousWatch {
   shareContext(videoId) { return this.getShareService()?.context({ videoId }) ?? { enabled: false, paused: false, dailyRemaining: 0, recipients: [] }; }
   // 查看主页与私信许可由各自主服务维护，模型只看到核对后的最小上下文。
   async profileContext() {
-    try { const service = await this.controller.getProfileViewService?.(); return service?.context() ?? { enabled: false, prompt: '', remaining: 0 }; }
+    try {
+      const service = await this.controller.getProfileViewService?.();
+      const context = service?.context() ?? { enabled: false, prompt: '', remaining: 0 };
+      // 连续观看会话尚未结束时，即使当日额度用尽也允许再进同一作者主页（不额外扣额度）
+      if (this.profileSession && context.enabled) return { ...context, remaining: Math.max(context.remaining, 1) };
+      return context;
+    }
     catch { return { enabled: false, prompt: '', remaining: 0 }; }
   }
   async dmContext() {
@@ -270,10 +278,14 @@ export class AutonomousWatch {
       secUid = (detail.state || detail)?.video?.authorSecUid || null;
     }
     if (!secUid) throw Object.assign(new Error('当前作品没有可核对的作者主页地址，未打开主页。'), { code: 'WATCH_DECISION_FORMAT' });
-    // 额度在锁内预留，主页读取成功后再结算，避免两个入口同时通过检查。
-    let reservationId;
-    try { reservationId = await service.reserve(this.abort.signal); }
-    catch (error) { error.code ||= 'WATCH_DECISION_FORMAT'; throw error; }
+    // 同一次运行内重复进入同一作者主页不再扣额度，实现一次进主页连续看多条
+    const previousSession = this.profileSession;
+    const reuseSession = previousSession?.secUid === secUid && previousSession.count < PROFILE_SESSION_LIMIT;
+    let reservationId = null;
+    if (!reuseSession) {
+      try { reservationId = await service.reserve(this.abort.signal); }
+      catch (error) { error.code ||= 'WATCH_DECISION_FORMAT'; throw error; }
+    }
     this.phase = 'profile'; this.save({ phase: this.phase, pendingRequests: 0 });
     let current, state, visited = false, openFailure = null;
     try {
@@ -286,18 +298,27 @@ export class AutonomousWatch {
       if (state.pageKind !== 'user-profile' || !state.userProfile || state.userProfile.secUid !== secUid) throw failure('打开作者主页后没有读到可核对的主页资料，已停止自主观看。', 'needs_user');
       visited = true;
     } catch (error) { openFailure = error; }
-    try { await service.settle(reservationId, { visited }); }
-    catch (error) {
-      if (openFailure) { openFailure.settleError = error.message; throw openFailure; }
-      throw failure(`查看主页计数结算失败：${error.message}`, 'needs_user');
+    if (reservationId) {
+      try { await service.settle(reservationId, { visited }); }
+      catch (error) {
+        if (openFailure) { openFailure.settleError = error.message; throw openFailure; }
+        throw failure(`查看主页计数结算失败：${error.message}`, 'needs_user');
+      }
     }
     if (openFailure) throw openFailure;
     const profile = state.userProfile;
-    this.onEvent({ type: 'watch.profile', secUid, nickname: profile.nickname, workCount: profile.works.length, remaining: service.state().remaining });
+    const watched = reuseSession ? previousSession.watched : [];
+    this.profileSession = { secUid, count: (reuseSession ? previousSession.count : 0) + 1, watched: [...watched] };
+    const remainingWorks = profile.works.filter(item => !watched.includes(item.id));
+    this.onEvent({ type: 'watch.profile', secUid, nickname: profile.nickname, workCount: profile.works.length, remainingWorks: remainingWorks.length, reused: reuseSession, remaining: service.state().remaining });
+    if (!remainingWorks.length) {
+      this.profileSession = null;
+      return { current: await this.execute('douyin_open', {}, { allowLoading: true }) };
+    }
     const dmContext = await this.dmContext();
     this.phase = 'model'; this.pendingRequests = 1; this.save({ phase: this.phase, pendingRequests: 1 });
     let result;
-    try { this.reserveRequest(); result = await this.agent.decideProfile({ profile, context: this.personaMemory.context(), profilePrompt: service.policy().prompt, dmContext, signal: this.abort.signal, decisionProvider: this.decisionProvider }); }
+    try { this.reserveRequest(); result = await this.agent.decideProfile({ profile: { ...profile, works: remainingWorks }, context: this.personaMemory.context(), profilePrompt: service.policy().prompt, dmContext, signal: this.abort.signal, decisionProvider: this.decisionProvider }); }
     finally { this.pendingRequests = 0; this.phase = 'waiting'; this.save({ phase: this.phase, pendingRequests: 0 }); }
     this.assertAllowed();
     let decision;
@@ -314,7 +335,7 @@ export class AutonomousWatch {
     current = await this.execute('douyin_status');
     state = current.state || current;
     if (state.pageKind !== 'user-profile' || state.userProfile?.secUid !== secUid) { this.onEvent({ type: 'watch.decision-discarded', action: decision.action, reasonCode: 'profile-page-changed' }); return { current }; }
-    if (decision.action === 'stop') return { current, stopRequested: true };
+    if (decision.action === 'stop') { this.profileSession = null; return { current, stopRequested: true }; }
     if (decision.action === 'open_work') {
       const work = (state.userProfile.works || []).find(item => item.id === decision.workId);
       if (!work) {
@@ -324,6 +345,7 @@ export class AutonomousWatch {
         if (this.invalidDecisionStreak >= 3) throw failure('连续三次未取得有效观看决策，已停止本次观看；今日用量保留。');
         return { current: await this.execute('douyin_open', {}, { allowLoading: true }) };
       }
+      this.profileSession.watched.push(work.id);
       current = await this.execute('douyin_open_video', { url: work.url }, { allowLoading: true });
       return { current };
     }
@@ -333,6 +355,8 @@ export class AutonomousWatch {
       if (delivery?.deliveryUncertain) throw failure('私信发送结果未确认，请在抖音核对，已停止自主观看；不会重发。', 'needs_user');
       if (delivery?.confirmed !== true) throw failure(delivery?.message || '没有确认私信发送成功。', 'needs_user');
     }
+    // 模型选择离开或发完私信后结束本次连续观看，下次进主页重新计额度
+    this.profileSession = null;
     return { current: await this.execute('douyin_open', {}, { allowLoading: true }) };
   }
   async recoverDecision(error) {
@@ -476,7 +500,7 @@ export class AutonomousWatch {
   }
   async run() {
     let status = 'stopped', lastError = '';
-    this.liveSkipStreak = 0;this.invalidDecisionStreak=0;this.shareProgress=null;
+    this.liveSkipStreak = 0;this.invalidDecisionStreak=0;this.shareProgress=null;this.profileSession=null;
     try {
       this.save({shareProgress:null,decisionRetry:null});
       let current = await this.execute('douyin_status', {}, { allowLoading: true });
