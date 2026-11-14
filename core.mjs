@@ -341,22 +341,28 @@ export function readPageState() {
     const playerId=/(?:^|\s)video_(\d+)(?:\s|$)/.exec(element.closest('[data-e2e="player-container"]')?.className??'')?.[1],activeId=/(?:^|\s)video_(\d+)(?:\s|$)/.exec(activeContainer?.className??'')?.[1];
     videoIdentityConflict=Boolean(playerId&&activeId&&playerId!==activeId);
     const id = videoIdentityConflict?null:playerId || activeId || links.map(e=>workId(e.href)).find(Boolean) || workId(location.href) || null;
+    // 评论、右侧推荐视频里的用户链接不属于本作品作者，不能拿来打开主页。
+    const nonAuthorArea='[data-e2e="comment-item"],[data-e2e="aweme-relate"],[data-e2e="related-video"],[data-e2e="recommend-list"],[data-e2e*="related"],[data-e2e*="recommend"]';
     // 主页推荐流里的作者链接未必在作品容器内，退化为按距离找最近一个 @作者 链接
     const nearestUserLink = () => {
       const r0 = element.getBoundingClientRect();
       let best = null, bestDistance = Infinity;
       for (const link of document.querySelectorAll('a[href*="/user/"]')) {
-        if (!visible(link) || link.closest(privateArea) || !/^@/.test(clean(link.textContent))) continue;
+        if (!visible(link) || link.closest(privateArea) || link.closest(nonAuthorArea) || !/^@/.test(clean(link.textContent))) continue;
         const r = link.getBoundingClientRect();
         const distance = Math.hypot((r.left + r.width / 2) - (r0.left + r0.width / 2), (r.top + r.height / 2) - (r0.top + r0.height / 2));
         if (distance < bestDistance) { bestDistance = distance; best = link; }
       }
       return best;
     };
-    const authorElement = links.find(e => /\/user\//.test(e.href)) || nearestUserLink() || [...(container?.querySelectorAll('span,div')??[])].find(e=>e.childElementCount===0 && /^@/.test(clean(e.textContent)) && visible(e));
+    const userLinks = links.filter(e => /\/user\//.test(e.getAttribute('href') || ''));
+    // 详情页作者区优先，其次是评论和推荐区之外的链接，最后才按原有顺序兜底。
+    const authorElement = userLinks.find(e => e.closest('[data-e2e="user-info"]')) || userLinks.find(e => !e.closest(nonAuthorArea)) || userLinks[0] || nearestUserLink() || [...(container?.querySelectorAll('span,div')??[])].find(e=>e.childElementCount===0 && /^@/.test(clean(e.textContent)) && visible(e));
     const authorSecUid = authorElement ? /\/user\/([A-Za-z0-9_-]+)/.exec(authorElement.getAttribute?.('href') || authorElement.href || '')?.[1] ?? null : null;
     const titleElement = container?.querySelector('[data-e2e="video-desc"],[data-e2e="video-title"],[data-e2e="detail-video-info"],[class*="video-info-detail"]');
-    const detailAuthor=container?.querySelector('[data-e2e="related-video"]')?.innerText?.split('\n').map(clean).find(Boolean);
+    // 详情页头像链接没有文字，昵称从同一作者信息区第一行读取；推荐视频区的整块文本不能当作者。
+    const authorBlock=authorElement?.closest('[data-e2e="user-info"],[data-e2e*="author"]');
+    const detailAuthor=authorBlock?(authorBlock.innerText||'').split('\n').map(clean).find(Boolean):null;
     const captionAuthor=/@([^·\n]+)·/.exec(titleElement?.textContent??'')?.[1]?.trim();
     const r = element.getBoundingClientRect();
     video = { id, url: id ? `https://www.douyin.com/video/${id}` : null,

@@ -104,6 +104,21 @@ test('主页弹层关闭后残留播放器不冒充当前视频，modal_id存在
   assert.equal(modalState.pageKind, 'video'); assert.equal(modalState.video.id, '111'); assert.equal(modalState.userProfile.secUid, 'synthetic-author');
 });
 
+test('详情页只把作者区链接当作作者，评论和推荐作者不冒充', async t => {
+  const body = `<div data-e2e="video-detail">
+    <a href="/user/comment-author">合成评论者</a>
+    <div data-e2e="player-container" class="video_111"><video muted autoplay playsinline style="width:240px;height:320px"></video></div>
+    <div data-e2e="video-desc">合成作品标题</div>
+    <div data-e2e="user-info"><a href="/user/real-author" style="display:inline-block;width:40px;height:40px"></a><span>合成作者</span></div>
+    <div data-e2e="aweme-relate"><a href="/user/related-author">合成推荐作者</a></div>
+  </div>`;
+  const f = await fixture(t, { url: 'https://www.douyin.com/video/111', body });
+  const state = await f.page.evaluate(readPageState);
+  assert.equal(state.video.id, '111');
+  assert.equal(state.video.authorSecUid, 'real-author');
+  assert.equal(state.video.author, '合成作者');
+});
+
 test('真实合成视频：未允许观看时拒绝播放，并直接暂停已有页面',async t=>{
   const {page,controller}=await fixture(t);
   const directory=fs.mkdtempSync(path.join(os.tmpdir(),'douyin-limits-core-'));
