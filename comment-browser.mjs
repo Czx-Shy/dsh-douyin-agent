@@ -429,7 +429,15 @@ export function readCommentDom(input) {
 function assertVideo(state, expectedVideoId) {
   if (state?.loginRequired || state?.verificationRequired || state?.unsupportedPage || state?.privateChatVisible || state?.blocked || state?.video?.id !== expectedVideoId || state.video.readyState < 2) throw new Error('当前作品、登录状态或页面遮挡无法核对，未发布评论。');
   const url = state.video.url || state.url;
-  if (url) { let current; try { current = new URL(url); } catch {} if (!current || current.origin !== 'https://www.douyin.com' || /^\/video\/(\d+)\/?$/.exec(current.pathname)?.[1] !== expectedVideoId) throw new Error('当前作品链接与预期不一致，未发布评论。'); }
+  if (url) {
+    let current;
+    try { current = new URL(url); } catch {}
+    // 详情页用 /video/<id>，主页弹层用 ?modal_id=<id> 或 ?aweme_id=<id>，都代表当前作品。
+    const routeId = current?.origin === 'https://www.douyin.com'
+      ? /^\/video\/(\d+)\/?$/.exec(current.pathname)?.[1] || current.searchParams.get('modal_id') || current.searchParams.get('aweme_id')
+      : null;
+    if (!current || current.origin !== 'https://www.douyin.com' || routeId !== expectedVideoId) throw new Error('当前作品链接与预期不一致，未发布评论。');
+  }
 }
 
 export class CommentBrowser {
