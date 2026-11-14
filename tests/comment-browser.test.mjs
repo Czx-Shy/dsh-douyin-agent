@@ -231,6 +231,33 @@ test('主页弹层属于其他作品时仍拒绝发布', async t => {
   const f = await fixture(t, { url: 'https://www.douyin.com/user/synthetic-author?modal_id=67890' }), result = await f.post();
   assert.equal(result.confirmed, false); assert.equal(result.deliveryUncertain, false); assert.equal(await f.page.evaluate(() => window.commentClicks), 0);
 });
+test('回复模式只点击指定评论的回复入口，并在发布后确认新评论', async t => {
+  const f = await fixture(t, { result: { id: '90003', mine: true, status: 'sent', videoId: '12345' }, existing: [
+    { id: '90001', mine: false, status: 'sent', text: '第一条评论' },
+    { id: '90002', mine: false, status: 'sent', text: '第二条评论' },
+  ] });
+  await f.page.evaluate(() => {
+    window.replyClicks = [];
+    [...document.querySelectorAll('[data-e2e="comment-item"]')].forEach((row, index) => {
+      const reply = document.createElement('span'); reply.textContent = '回复';
+      reply.style.cssText = 'display:inline-block;cursor:pointer;width:40px;height:20px';
+      reply.addEventListener('click', () => {
+        window.replyClicks.push(index + 1);
+        const editor = document.querySelector('[contenteditable]');
+        editor.setAttribute('aria-label', `回复 @合成用户${index + 1}`); editor.focus();
+      });
+      row.append(reply);
+    });
+  });
+  const result = await f.commenter.post({ expectedVideoId: '12345', text, replyToIndex: 2 }, { authorize: f.authorize });
+  assert.equal(result.confirmed, true); assert.deepEqual(await f.page.evaluate(() => window.replyClicks), [2]);
+});
+test('没有回复序号时，输入框处于回复状态仍拒绝改发新评论', async t => {
+  const f = await fixture(t, { existing: [{ id: '90001', mine: false, status: 'sent', text: '原评论' }] });
+  await f.page.evaluate(() => document.querySelector('[contenteditable]').setAttribute('aria-label', '回复 @合成用户'));
+  const result = await f.post();
+  assert.equal(result.confirmed, false); assert.equal(result.reason, '当前输入框处于回复他人的状态，未改发回复或@。'); assert.equal(await f.page.evaluate(() => window.commentClicks), 0);
+});
 test('只读评论字段不含账号、昵称或头像，明确限定作品', async t => {
   const f = await fixture(t, { existing: [{ id: '90000', mine: true, status: 'sent', text: '合成已有评论' }] }); await f.page.evaluate(() => { const row = document.querySelector('[data-e2e="comment-item"]'); row.insertAdjacentHTML('beforeend', '<a href="/user/synthetic-private-account">合成评论者姓名</a><img src="https://synthetic.invalid/avatar-private">'); });
   const snapshot = await f.page.evaluate(readCommentDom, '12345'); assert.deepEqual(Object.keys(snapshot.rows[0]).sort(), ['commentId', 'videoId', 'text', 'mine', 'sent', 'pending', 'failed'].sort()); assert.equal(JSON.stringify(snapshot).includes('private'), false); assert.equal(JSON.stringify(snapshot).includes('姓名'), false);

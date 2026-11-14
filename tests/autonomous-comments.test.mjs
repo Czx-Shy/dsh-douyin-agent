@@ -55,6 +55,15 @@ test('确认回执精确绑定作品和commentId，预留扣每日与单轮次�
   assert.equal(f.service.state().daily.attempts, 1); assert.equal(f.service.state().session.remaining, 0); assert.equal(f.service.context().enabled, false); assert.equal(f.service.ledger().operations[0].status, 'confirmed');
   await assert.rejects(f.service.comment(f.evidence('67890'), f.controls), /次数/); assert.equal(fs.existsSync(f.service.files.send), false);
 });
+test('回复评论序号只接受有限整数，并原样传给发布器', async t => {
+  const f = fixture(t); f.service.configure({ enabled: true }, { explicit: true });
+  const input = f.evidence();
+  for (const replyToIndex of [0, 51, 1.5, '2']) await assert.rejects(f.service.comment({ ...input, replyToIndex }, f.controls), /只接受/);
+  assert.equal(f.calls.length, 0);
+  const result = await f.service.comment({ ...input, replyToIndex: 2 }, f.controls);
+  assert.equal(result.confirmed, true); assert.equal(f.calls[0].input.replyToIndex, 2);
+  assert.equal(f.service.ledger().operations[0].replyToIndex, 2);
+});
 test('停启同一轮不重置次数，新轮只重置单轮额度，跨日也不重复旧作品', async t => {
   const f = fixture(t); f.service.configure({ enabled: true, dailyLimit: 3, perSessionLimit: 1 }, { explicit: true }); const first = f.evidence(); await f.service.comment(first, f.controls);
   f.lock(); await assert.rejects(f.service.comment(f.evidence('67890'), f.controls), /次数/);

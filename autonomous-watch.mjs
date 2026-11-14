@@ -5,8 +5,8 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { ApiAgent, redact, watchDecisionMessages, parseWatchDecision, parseProfileDecision } from './api-agent.mjs?v=20';
 import { resolveRuntimePaths } from './runtime-paths.mjs';
 import { AutonomousShare, isSharePreflightNotSent } from './autonomous-share.mjs?v=9';
-import { AutonomousComments } from './autonomous-comments.mjs?v=9';
-import { PublicCommentAgent } from './public-comment-agent.mjs?v=9';
+import { AutonomousComments } from './autonomous-comments.mjs?v=10';
+import { PublicCommentAgent } from './public-comment-agent.mjs?v=10';
 import { DailyReport } from './daily-report.mjs?v=9';
 
 import { WatchOptions } from './watch-options.mjs';
@@ -548,7 +548,8 @@ export class AutonomousWatch {
           try {
             this.assertAllowed();
             const read = await this.controller.execute('douyin_read_comments', {}, { signal: this.abort.signal, autonomousRunId: this.runId });
-            const comments = (read.comments || []).filter(item => typeof item?.text === 'string' && item.text.trim()).slice(0, 8).map(item => ({ text: item.text.slice(0, 200), mine: item.mine === true }));
+            // 保留原始评论顺序，回复序号必须和评论面板里的评论行一一对应。
+            const comments = (read.comments || []).slice(0, 8).map(item => ({ text: typeof item?.text === 'string' ? item.text.slice(0, 200) : '', mine: item?.mine === true }));
             if (comments.length) observation = { ...observation, observation: { ...(observation.observation || {}), comments } };
           } catch (error) { this.onEvent({ type: 'watch.comments-unavailable', videoId: observedState.video.id, message: error.message }); }
         }
@@ -626,7 +627,7 @@ export class AutonomousWatch {
           finally{this.pendingRequests=0;this.phase='waiting';this.save({phase:this.phase,pendingRequests:0});}
           this.assertAllowed();
           if (generated.text !== null) {
-            const delivery = await this.getCommentService().comment({ evidenceId, videoId: observedState.video.id, text: generated.text }, { signal: this.abort.signal, watchRunId: this.runId });
+            const delivery = await this.getCommentService().comment({ evidenceId, videoId: observedState.video.id, text: generated.text, ...(generated.replyToIndex ? { replyToIndex: generated.replyToIndex } : {}) }, { signal: this.abort.signal, watchRunId: this.runId });
             this.onEvent({ type: 'watch.comment', delivery, usage: generated.usage });
             if (delivery?.deliveryUncertain) throw failure('评论发布结果未确认，请在抖音核对，已停止自主观看。', 'needs_user');
             if (delivery?.confirmed !== true) throw failure(delivery?.reason || '没有确认公开评论发布成功。', 'needs_user');

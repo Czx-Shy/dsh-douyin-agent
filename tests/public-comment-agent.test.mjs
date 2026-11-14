@@ -54,3 +54,17 @@ test('取消在模型返回之前生效；取消后到达的文本不进入发�
   const rejected = assert.rejects(generating, /合成取消/); await entered.promise; abort.abort(new Error('合成取消')); await rejected; finish.resolve(answer('不应迟发的评论'));
   let calls = 0; await assert.rejects(agent.generate({ observation: observation(), signal: abort.signal, decisionProvider: async () => { calls++; return answer('不应执行'); } }), /合成取消/); assert.equal(calls, 0);
 });
+
+test('回复评论只接受已读评论内的序号，并把评论正文按原顺序交给模型', async () => {
+  const value = observation(); value.observation = { comments: [{ text: '第一条约评' }, { text: '第二条约评' }, { text: '' }] };
+  let seen; const agent = new PublicCommentAgent();
+  const result = await agent.generate({ observation: value, decisionProvider: async request => { seen = request; return { text: JSON.stringify({ text: '赞同第二条。', replyToIndex: 2 }), usage: {} }; } });
+  assert.equal(result.text, '赞同第二条。'); assert.equal(result.replyToIndex, 2);
+  const prompt = seen.messages[1].content[0].text;
+  assert.match(prompt, /已读评论/); assert.match(prompt, /第二条约评/); assert.match(prompt, /"index":3/);
+  const reply = (replyToIndex, text = '回复正文') => ({ text: JSON.stringify({ text, replyToIndex }), usage: {} });
+  for (const replyToIndex of [0, 4, 1.5, '2']) await assert.rejects(agent.generate({ observation: value, decisionProvider: async () => reply(replyToIndex) }));
+  await assert.rejects(agent.generate({ observation: value, decisionProvider: async () => ({ text: JSON.stringify({ text: null, replyToIndex: 1 }), usage: {} }) }));
+  const empty = observation();
+  await assert.rejects(agent.generate({ observation: empty, decisionProvider: async () => reply(1) }));
+});

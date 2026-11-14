@@ -39,7 +39,7 @@ async function waitCommentState(test, check, signal, timeoutMs) {
   do { stop(signal); await check(); if (await test()) return true; if (Date.now() >= deadline) break; await waitForCommentTick(75, undefined, { signal }); } while (Date.now() < deadline);
   return false;
 }
-async function prepareCommentPointer(page, locator, { check, signal, expectedVideoId, mode, expectedDraft, nativeIcon = false, scope: scopeLocator = locator }) {
+async function prepareCommentPointer(page, locator, { check, signal, expectedVideoId, mode, expectedDraft, nativeIcon = false, reply = false, scope: scopeLocator = locator }) {
   stop(signal); await check();
   if (await locator.count() !== 1) throw new Error('评论输入目标不唯一，未输入。');
   const currentSelf = await page.evaluate(readCommentSelfIdentity);
@@ -140,7 +140,7 @@ async function prepareCommentPointer(page, locator, { check, signal, expectedVid
         if (marked.length !== 1 || marked[0] !== element || currentScopes.length !== 1 || currentScopes[0] !== scope || !scope.isConnected || !scope.contains(element) || scope.closest(privateArea) || scope.querySelector(privateArea) || !ownerMatches() || !element.isConnected || element.closest(privateArea) || !visible(element) || element.closest('[disabled],[aria-disabled="true"],[data-disabled="true"],.disabled') || !iconMatches() || !videoMatches()) return null;
         const editors = editorsInScope();
         if (input.mode === 'lazy' ? editors.length > 1 : editors.length !== 1 || editors[0] !== draftElement) return null;
-        if ([...scope.querySelectorAll('[data-e2e="comment-reply-target"],.PPsJmqBy')].some(visible) || /^回复\s*[@＠]/.test(draftElement?.getAttribute('aria-label') || '') || [...scope.querySelectorAll('input[type="file"]')].some(file => file.files?.length || file.value)) return null;
+        if (!input.reply && [...scope.querySelectorAll('[data-e2e="comment-reply-target"],.PPsJmqBy')].some(visible) || !input.reply && /^回复\s*[@＠]/.test(draftElement?.getAttribute('aria-label') || '') || [...scope.querySelectorAll('input[type="file"]')].some(file => file.files?.length || file.value)) return null;
         if ([...document.querySelectorAll('[data-e2e="im-dialog"],#captcha_container,[id^="captcha_container"],[data-e2e="captcha-container"]')].some(visible)) return null;
         if ([...document.querySelectorAll('body *')].some(node => !node.childElementCount && visible(node) && !node.closest(privateArea) && /扫码登录|验证码登录|登录后即可|手机扫码登录|请完成下方验证|请完成验证|安全验证|拖动滑块/.test(node.textContent || ''))) return null;
         const self = readSelf(); if (!self.ready || self.ownProfileId !== input.ownProfileId) return null;
@@ -168,7 +168,7 @@ async function prepareCommentPointer(page, locator, { check, signal, expectedVid
       entries[input.token] = entry;
       element.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'instant' });
       return true;
-    }, { token, mode, expectedVideoId, expectedDraft, ownProfileId: currentSelf.ownProfileId, icon: nativeIcon ? NATIVE_PUBLISH_ICON : null });
+    }, { token, mode, expectedVideoId, expectedDraft, reply, ownProfileId: currentSelf.ownProfileId, icon: nativeIcon ? NATIVE_PUBLISH_ICON : null });
     if (!installed) throw new Error('评论输入几何见证未安装，未输入。');
     const readPoint = () => page.evaluate(token => window.__deepseekCommentGeometryInputs?.[token]?.readPoint() || null, token);
     let previous, stablePoint, stableSamples = 0;
@@ -222,6 +222,39 @@ export async function ensureCommentPanel(page, { check = async () => {}, signal 
     if (await panelReady()) return { expanded: true };
   }
   return { expanded: false, reason: 'comment-panel-not-ready' };
+}
+
+// 只点击指定序号评论行里唯一的“回复”入口，并核对输入框确实进入回复状态。
+async function openCommentReply(page, replyToIndex, check, signal) {
+  const deadline = Date.now() + 4000;
+  let last = 'comment-reply-unavailable';
+  while (Date.now() < deadline) {
+    stop(signal); await check();
+    const rows = page.locator('[data-e2e="comment-item"]').filter({ visible: true });
+    if (await rows.count() >= replyToIndex) {
+      const row = rows.nth(replyToIndex - 1);
+      const reply = row.getByText('回复', { exact: true }).filter({ visible: true });
+      if (await reply.count() === 1) {
+        await reply.click();
+        for (let attempt = 0; attempt < 12; attempt++) {
+          await waitForCommentTick(250, undefined, { signal });
+          stop(signal);
+          const replied = await page.evaluate(() => [...document.querySelectorAll('[contenteditable="true"],textarea')].some(element => {
+            if (!element.isConnected || element.closest('[data-e2e="im-dialog"],[data-e2e="danmaku-container"]')) return false;
+            const rect = element.getBoundingClientRect();
+            if (!(rect.width > 0 && rect.height > 0)) return false;
+            return /^回复\s*[@＠]/.test(element.getAttribute('aria-label') || '') || Boolean(element.closest('.comment-input-container,.comment-input-inner-container,[data-e2e="comment-input"]')?.querySelector('[data-e2e="comment-reply-target"],.PPsJmqBy'));
+          }));
+          if (replied) return { replied: true, index: replyToIndex };
+          last = 'comment-reply-not-activated';
+        }
+        throw new Error('点击回复后输入框没有进入回复状态，未输入。');
+      }
+      last = await reply.count() > 1 ? 'comment-reply-ambiguous' : 'comment-reply-missing';
+    }
+    await waitForCommentTick(250, undefined, { signal });
+  }
+  throw new Error(`没有找到可回复的评论（${last}），未输入。`);
 }
 
 async function activateCommentEditor(page, expectedVideoId, check, signal) {
@@ -356,7 +389,8 @@ export function readCommentSelfIdentity() {
 export function readCommentDom(input) {
   const expectedVideoId = typeof input === 'string' ? input : input?.expectedVideoId;
   const trustedOwnProfileId = typeof input === 'object' && input !== null ? input.ownProfileId : null;
-  if (typeof input !== 'string' && (!input || Object.keys(input).some(key => !['expectedVideoId', 'ownProfileId'].includes(key)) || typeof trustedOwnProfileId !== 'string' || !/^[A-Za-z0-9_-]{5,300}$/.test(trustedOwnProfileId))) return { rows: [] };
+  const includeReplies = typeof input === 'object' && input !== null && input.includeReplies === true;
+  if (typeof input !== 'string' && (!input || Object.keys(input).some(key => !['expectedVideoId', 'ownProfileId', 'includeReplies'].includes(key)) || typeof trustedOwnProfileId !== 'string' || !/^[A-Za-z0-9_-]{5,300}$/.test(trustedOwnProfileId))) return { rows: [] };
   const visible = element => { const r = element.getBoundingClientRect(), s = getComputedStyle(element); return r.width > 0 && r.height > 0 && r.bottom > 0 && r.right > 0 && r.top < innerHeight && r.left < innerWidth && s.display !== 'none' && s.visibility !== 'hidden'; };
   const profileId = anchor => {
     try { const url = new URL(anchor.getAttribute('href'), 'https://www.douyin.com/'); return url.origin === 'https://www.douyin.com' && !url.username && !url.password ? /^\/user\/([A-Za-z0-9_-]{5,300})\/?$/.exec(url.pathname)?.[1] || null : null; } catch { return null; }
@@ -401,7 +435,7 @@ export function readCommentDom(input) {
 
   const result = [];
   for (const row of document.querySelectorAll('[data-e2e="comment-item"]')) {
-    if (!visible(row) || row.closest(privateArea) || row.parentElement?.closest('[data-e2e="comment-item"]')) continue;
+    if (!visible(row) || row.closest(privateArea) || (!includeReplies && row.parentElement?.closest('[data-e2e="comment-item"]'))) continue;
     const owned = selector => [...row.querySelectorAll(selector)].filter(element => element.closest('[data-e2e="comment-item"]') === row);
     const ancestorVideoId = row.closest('[data-aweme-id],[data-video-id]')?.getAttribute('data-aweme-id') || row.closest('[data-video-id]')?.getAttribute('data-video-id');
     if (ancestorVideoId && ancestorVideoId !== expectedVideoId) continue;
@@ -453,8 +487,10 @@ export class CommentBrowser {
   record(operation) { const value = this.receipts(), index = value.operations.findIndex(item => item.operationId === operation.operationId), stored = preserveReceiptBaseline(index < 0 ? null : value.operations[index], operation, 'public-comment'); if (index < 0) value.operations.push(stored); else value.operations[index] = stored; write(this.receiptsFile, value); }
   acquire() { fs.mkdirSync(this.stateDir, { recursive: true }); let descriptor; try { descriptor = fs.openSync(this.guardFile, 'wx', 0o600); } catch (error) { if (error.code === 'EEXIST') throw new Error('其他评论仍在处理，或发布锁需要核对；未抢锁重试。'); throw error; } const owner = { pid: process.pid, token: randomUUID() }; try { fs.writeFileSync(descriptor, JSON.stringify(owner)); } finally { fs.closeSync(descriptor); } return () => { const current = JSON.parse(fs.readFileSync(this.guardFile, 'utf8')); if (current?.pid === owner.pid && current.token === owner.token) fs.unlinkSync(this.guardFile); }; }
   async gate(signal) { stop(signal); const state = this.videoLimits.state(); if (!state.allowed) throw new Error(state.reason || '有限观看时段已结束，未发布评论。'); }
-  async post({ expectedVideoId, text, ...extra } = {}, { signal: parentSignal, authorize, autonomousRunId } = {}) {
-    if (typeof expectedVideoId !== 'string' || !/^\d{1,64}$/.test(expectedVideoId) || Object.keys(extra).length) throw new TypeError('评论只能指定当前作品编号与纯文字。');
+  async post({ expectedVideoId, text, replyToIndex, ...extra } = {}, { signal: parentSignal, authorize, autonomousRunId } = {}) {
+    if (typeof expectedVideoId !== 'string' || !/^\d{1,64}$/.test(expectedVideoId) || replyToIndex !== undefined && (!Number.isSafeInteger(replyToIndex) || replyToIndex < 1 || replyToIndex > 50) || Object.keys(extra).length) throw new TypeError('评论只能指定当前作品编号、纯文字和可选回复序号。');
+    // 回复序号对应当前评论面板中可见的顶层评论顺序；不传则保持只发新评论。
+    const reply = replyToIndex ?? null;
     text = validateCommentText(text);
     if (typeof authorize !== 'function' || typeof authorize.beginDispatch !== 'function') return { confirmed: false, deliveryUncertain: false, videoId: expectedVideoId, reason: '评论缺少可信本机许可与最终短输入控制，未发布。' };
     const interrupt = new AbortController(), signal = AbortSignal.any([interrupt.signal, ...(parentSignal ? [parentSignal] : [])]);
@@ -474,6 +510,7 @@ export class CommentBrowser {
         const checkPage = async () => { await authorized('monitor'); await this.gate(signal); assertVideo(await page.evaluate(readPageState), expectedVideoId); await checkSelf(); };
         await checkPage();
         await ensureCommentPanel(page, { check: checkPage, signal });
+        if (reply) await openCommentReply(page, reply, checkPage, signal);
         const editors = await activateCommentEditor(page, expectedVideoId, checkPage, signal);
         if (await editors.count() !== 1) return { confirmed: false, deliveryUncertain: false, videoId: expectedVideoId, needsUserAction: true, reason: '当前页面没有唯一可核对的评论输入框，需要先打开评论面板或等待适配。' };
         const editor = editors;
@@ -484,8 +521,8 @@ export class CommentBrowser {
         const draft = () => editor.evaluate(element => element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement ? element.value : element.innerText);
         const hasFile = () => root.locator('input[type="file"]').evaluateAll(inputs => inputs.some(input => input.files?.length || input.value));
         if (cleanDraft(await draft()) || await editor.locator('img,video,audio,a,[data-slate-void="true"]').count() || await hasFile()) return { confirmed: false, deliveryUncertain: false, videoId: expectedVideoId, reason: '评论输入框已有草稿或媒体内容，已保留原内容。' };
-        if (await root.locator('[data-e2e="comment-reply-target"],.PPsJmqBy').filter({ visible: true }).count() || await editor.getAttribute('aria-label').then(value => /回复\s*[@＠]/.test(value || ''))) return { confirmed: false, deliveryUncertain: false, videoId: expectedVideoId, reason: '当前输入框处于回复他人的状态，未改发回复或@。' };
-        const before = await page.evaluate(readCommentDom, { expectedVideoId, ownProfileId });
+        if (!reply && await root.locator('[data-e2e="comment-reply-target"],.PPsJmqBy').filter({ visible: true }).count() || !reply && await editor.getAttribute('aria-label').then(value => /回复\s*[@＠]/.test(value || ''))) return { confirmed: false, deliveryUncertain: false, videoId: expectedVideoId, reason: '当前输入框处于回复他人的状态，未改发回复或@。' };
+        const before = await page.evaluate(readCommentDom, { expectedVideoId, ownProfileId, includeReplies: Boolean(reply) });
         operation.baseline = createCommentReceiptBaseline(operation, { rows: before.rows, ownProfileId, text });
         const knownIds = new Set(operation.baseline.knownIds);
         let monitoring = true, polling, prepared = false, releaseDispatch, submitPointer;
@@ -494,7 +531,7 @@ export class CommentBrowser {
         const check = async () => {
           if (clicked && await inputDispatched()) return;
           await checkPage();
-          if (await editors.count() !== 1 || !await composerScopeValid(root, expectedVideoId) || prepared && cleanDraft(await draft()) !== text || await hasFile() || await root.locator('[data-e2e="comment-reply-target"],.PPsJmqBy').filter({ visible: true }).count()) throw new Error('等待期间评论输入、发布目标或草稿发生变化，未发布。');
+          if (await editors.count() !== 1 || !await composerScopeValid(root, expectedVideoId) || prepared && cleanDraft(await draft()) !== text || await hasFile() || !reply && await root.locator('[data-e2e="comment-reply-target"],.PPsJmqBy').filter({ visible: true }).count()) throw new Error('等待期间评论输入、发布目标或草稿发生变化，未发布。');
           if (send) {
             const latest = await findCommentSubmit(editor, expectedVideoId);
             if (await send.count() !== 1 || !latest.send || await latest.send.getAttribute('data-deepseek-comment-control') !== witnessId) throw new Error('等待期间评论发布控件发生变化或出现歧义，未发布。');
@@ -504,7 +541,7 @@ export class CommentBrowser {
         const timer = setInterval(() => { if (!monitoring || polling) return; polling = check().catch(async error => { if (monitoring && !await inputDispatched().catch(() => false)) interrupt.abort(error); }).finally(() => { polling = null; }); }, 40);
         try {
           await check();
-          const focus = await prepareCommentPointer(page, editor, { check, signal, expectedVideoId, mode: 'editor', expectedDraft: '', scope: root });
+          const focus = await prepareCommentPointer(page, editor, { check, signal, expectedVideoId, mode: 'editor', expectedDraft: '', reply: Boolean(reply), scope: root });
           try { await focus.click(); } finally { await focus.close(); }
           stop(signal);
           // 使用浏览器真实文字输入触发受控编辑器；填写与页面回读一致后才等待发布按钮。
@@ -518,7 +555,7 @@ export class CommentBrowser {
           await check();
           const enabled = await waitCommentState(() => page.evaluate(token => { const element = [...document.querySelectorAll('[data-deepseek-comment-control]')].find(item => item.getAttribute('data-deepseek-comment-control') === token); return Boolean(element && !element.closest(':disabled,[aria-disabled="true"],[data-disabled="true"],.disabled') && (element.getAttribute('data-deepseek-comment-native-publish') !== token || element.classList.contains('jfGCpJo0'))); }, witnessId), check, signal, 3000);
           if (!enabled) throw Object.assign(new Error('评论发布控件尚不可用，草稿已保留，未点击。'), { needsUserAction: true });
-          submitPointer = await prepareCommentPointer(page, send, { check, signal, expectedVideoId, mode: 'submit', expectedDraft: text, nativeIcon: selected.nativeIcon, scope: root });
+          submitPointer = await prepareCommentPointer(page, send, { check, signal, expectedVideoId, mode: 'submit', expectedDraft: text, nativeIcon: selected.nativeIcon, reply: Boolean(reply), scope: root });
           stop(signal); await check();
           if (await inputDispatched()) { dispatched = true; throw new Error('等待期间已发生发布输入，未再点击一次。'); }
           await authorized('before-click'); releaseDispatch = await authorize.beginDispatch(); if (typeof releaseDispatch !== 'function') throw new Error('最终评论输入未取得可释放的本机许可。');
@@ -529,7 +566,7 @@ export class CommentBrowser {
           for (let attempt = 0; attempt < 12; attempt++) {
             stop(signal); assertVideo(await page.evaluate(readPageState), expectedVideoId);
             await checkSelf();
-            const current = await page.evaluate(readCommentDom, { expectedVideoId, ownProfileId });
+            const current = await page.evaluate(readCommentDom, { expectedVideoId, ownProfileId, includeReplies: Boolean(reply) });
             await checkSelf();
             const matches = current.rows.filter(item => item.commentId && !knownIds.has(item.commentId) && item.videoId === expectedVideoId && item.text === text && item.mine && item.sent && !item.failed && !item.pending);
             if (matches.length > 1 || new Set(current.rows.map(item => item.commentId).filter(Boolean)).size !== current.rows.filter(item => item.commentId).length) break;
