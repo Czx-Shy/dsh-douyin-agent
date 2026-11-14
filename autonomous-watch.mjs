@@ -543,6 +543,15 @@ export class AutonomousWatch {
         const observedAt = this.now(), observedState = observation.state || observation;
         if (isLivePreview(observedState)) { current = observation; continue; }
         if(readyImagePost(observedState)){current=observation;continue;}
+        // 主页作品弹层默认收起评论：复用评论读取把正文交给模型参考，失败不影响观看。
+        if (observedState.video?.id && /[?&]modal_id=/.test(observedState.url || '')) {
+          try {
+            this.assertAllowed();
+            const read = await this.controller.execute('douyin_read_comments', {}, { signal: this.abort.signal, autonomousRunId: this.runId });
+            const comments = (read.comments || []).filter(item => typeof item?.text === 'string' && item.text.trim()).slice(0, 8).map(item => ({ text: item.text.slice(0, 200), mine: item.mine === true }));
+            if (comments.length) observation = { ...observation, observation: { ...(observation.observation || {}), comments } };
+          } catch (error) { this.onEvent({ type: 'watch.comments-unavailable', videoId: observedState.video.id, message: error.message }); }
+        }
         watchDecisionMessages(observation);
         this.liveSkipStreak = 0;
         const title = String(observedState.video?.title || '');

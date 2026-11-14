@@ -23,6 +23,7 @@ export const TOOL_DEFINITIONS = [
   { name: 'douyin_next', description: '切换到下一条抖音视频，并返回切换后的状态。', parameters: empty() },
   { name: 'douyin_previous', description: '切换到上一条抖音视频，并返回切换后的状态。', parameters: empty() },
   { name: 'douyin_status', description: '读取抖音当前页面、可见文字与播放状态。文字不能代替视频画面内容。', parameters: empty() },
+  { name: 'douyin_read_comments', description: '读取当前作品可见的评论正文；主页作品弹层会自动展开评论面板。只读，不发布评论。', parameters: empty() },
   {
     name: 'douyin_observe',
     description: '观察当前视频一小段时间，采集画面和播放状态。只有支持图像输入的模型才能理解画面。',

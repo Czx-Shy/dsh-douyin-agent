@@ -192,6 +192,38 @@ async function prepareCommentPointer(page, locator, { check, signal, expectedVid
 }
 
 
+// 主页作品弹层默认收起评论面板。复用现有输入框和评论行判断，只在缺失时点一次评论入口。
+export async function ensureCommentPanel(page, { check = async () => {}, signal } = {}) {
+  const panelReady = () => page.evaluate(() => {
+    const visible = element => {
+      const rect = element.getBoundingClientRect(), style = getComputedStyle(element);
+      return rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.right > 0 && rect.top < innerHeight && rect.left < innerWidth && style.display !== 'none' && style.visibility !== 'hidden';
+    };
+    return [...document.querySelectorAll('.comment-input-inner-container')].some(visible) || [...document.querySelectorAll('[data-e2e="comment-item"]')].some(visible);
+  });
+  if (await panelReady()) return { expanded: false, alreadyOpen: true };
+  // 主页弹层会同时挂多个评论图标，只有当前作品的那一个在视口内；按坐标点击唯一可见入口。
+  const entry = await page.evaluate(() => {
+    const visible = element => {
+      const rect = element.getBoundingClientRect(), style = getComputedStyle(element);
+      return rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.right > 0 && rect.top < innerHeight && rect.left < innerWidth && style.display !== 'none' && style.visibility !== 'hidden';
+    };
+    const icons = [...document.querySelectorAll('[data-e2e="feed-comment-icon"]')].filter(visible);
+    if (icons.length !== 1) return null;
+    const rect = icons[0].getBoundingClientRect();
+    return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+  });
+  if (!entry) return { expanded: false, reason: 'comment-entry-unavailable' };
+  await check(); stop(signal);
+  await page.mouse.click(entry.x, entry.y);
+  for (let attempt = 0; attempt < 12; attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 300));
+    stop(signal);
+    if (await panelReady()) return { expanded: true };
+  }
+  return { expanded: false, reason: 'comment-panel-not-ready' };
+}
+
 async function activateCommentEditor(page, expectedVideoId, check, signal) {
   let editors = page.locator(EDITORS).filter({ visible: true });
   if (await editors.count()) return editors;
@@ -433,6 +465,7 @@ export class CommentBrowser {
         };
         const checkPage = async () => { await authorized('monitor'); await this.gate(signal); assertVideo(await page.evaluate(readPageState), expectedVideoId); await checkSelf(); };
         await checkPage();
+        await ensureCommentPanel(page, { check: checkPage, signal });
         const editors = await activateCommentEditor(page, expectedVideoId, checkPage, signal);
         if (await editors.count() !== 1) return { confirmed: false, deliveryUncertain: false, videoId: expectedVideoId, needsUserAction: true, reason: '当前页面没有唯一可核对的评论输入框，需要先打开评论面板或等待适配。' };
         const editor = editors;

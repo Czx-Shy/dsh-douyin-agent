@@ -119,6 +119,23 @@ test('详情页只把作者区链接当作作者，评论和推荐作者不冒�
   assert.equal(state.video.author, '合成作者');
 });
 
+test('主页弹层读取评论会展开评论面板并返回正文', async t => {
+  const workId = '1111111111111111111';
+  const body = `<div class="tab-user_self"><a href="/user/synthetic-self">我的</a></div>
+    <div data-e2e="user-info"><a href="/user/synthetic-author" style="display:inline-block;width:40px;height:40px"></a><span>合成作者</span></div>
+    <div data-e2e="player-container" class="video_${workId}"><video muted autoplay playsinline style="width:240px;height:320px"></video></div>
+    <div id="synthetic-comments" style="display:none">
+      <div class="comment-input-inner-container" data-placeholder="留下你的精彩评论吧"></div>
+      <div data-e2e="comment-item"><div data-e2e="comment-content">合成评论正文</div></div>
+    </div>
+    <div data-e2e="feed-comment-icon" style="width:24px;height:24px;background:#333" onclick="document.getElementById('synthetic-comments').style.display='block'"></div>`;
+  const f = await fixture(t, { url: `https://www.douyin.com/user/synthetic-author?modal_id=${workId}`, body });
+  const result = await f.controller.execute('douyin_read_comments');
+  assert.equal(result.videoId, workId);
+  assert.equal(result.expanded, true);
+  assert.deepEqual(result.comments.map(item => item.text), ['合成评论正文']);
+});
+
 test('真实合成视频：未允许观看时拒绝播放，并直接暂停已有页面',async t=>{
   const {page,controller}=await fixture(t);
   const directory=fs.mkdtempSync(path.join(os.tmpdir(),'douyin-limits-core-'));

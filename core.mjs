@@ -733,6 +733,29 @@ export class BrowserController {
     this.commentsPromise ??= import('./autonomous-comments.mjs?v=10').then(({ AutonomousComments }) => new AutonomousComments({ controller: this, personaMemory: this.getPersonaMemory(), videoLimits: this.limits(), stateDir: this.limits().stateDir, source: this.source === 'dsh' ? 'dsh' : 'api' })).catch(error => { this.commentsPromise = null; throw error; });
     return this.commentsPromise;
   }
+  // 复用评论模块的读取、身份核对与面板展开，只返回评论文本，不采集其他评论者资料。
+  async readComments(signal) {
+    signal?.throwIfAborted();
+    const state = await this.state({ record: false });
+    const videoId = state.video?.id;
+    if (!/^\d{10,30}$/.test(videoId || '')) throw new Error('当前没有可核对的作品，未读取评论。');
+    if (state.loginRequired || state.verificationRequired || state.blocked || state.privateChatVisible || state.unsupportedPage) throw Object.assign(new Error('页面需要手动处理，未读取评论。'), { watchStatus: 'needs_user' });
+    const { ensureCommentPanel, readCommentDom, readCommentSelfIdentity } = await import('./comment-browser.mjs?v=18');
+    const identity = await this.page.evaluate(readCommentSelfIdentity);
+    signal?.throwIfAborted();
+    if (!identity.ready) throw Object.assign(new Error('登录本人身份缺失或冲突，未读取评论。'), { needsUserAction: true, reasonCode: identity.reasonCode });
+    const panel = await ensureCommentPanel(this.page, { signal });
+    // 评论面板展开后列表仍会懒加载，给一个有上限的等待；没有评论时正常返回空列表。
+    let rows = [];
+    const deadline = Date.now() + 3000;
+    for (;;) {
+      ({ rows } = await this.page.evaluate(readCommentDom, { expectedVideoId: videoId, ownProfileId: identity.ownProfileId }));
+      if (rows.length || Date.now() >= deadline) break;
+      await new Promise(resolve => setTimeout(resolve, 250));
+      signal?.throwIfAborted();
+    }
+    return { videoId, expanded: panel.expanded === true || panel.alreadyOpen === true, comments: rows.filter(row => row.text).slice(0, 20).map(row => ({ text: row.text.slice(0, 300), mine: row.mine === true })) };
+  }
   getReport() {
     this.reportPromise ??= import('./daily-report.mjs?v=10').then(({ DailyReport }) => new DailyReport({ personaMemory: this.getPersonaMemory() })).catch(error => { this.reportPromise = null; throw error; });
     return this.reportPromise;
@@ -1074,6 +1097,7 @@ export class BrowserController {
           await (await this.currentVideo()).evaluate(async(video, play)=>{ if(play) await video.play();else video.pause(); },name==='douyin_play');
           if (name==='douyin_play') await wait(600,signal);
         }
+        if (name==='douyin_read_comments') return await this.readComments(signal);
         if (name==='douyin_observe'||name==='douyin_screenshot') {
           const result=await this.capture(name==='douyin_observe'?args.seconds??3:0,signal,{recordLearning:!autonomousRunId,sharedCaptureMode});
           if(sharedCaptureMode===undefined){this.storyboardFrames??=new StoryboardFrameStore();try{const id=this.storyboardFrames.remember(result);if(id)result.storyboardSampleId=id;}catch{this.storyboardFrames.clear();}}
