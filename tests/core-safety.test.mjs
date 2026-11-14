@@ -94,6 +94,16 @@ async function fixture(t, { url = 'https://www.douyin.com/video/111', body = vid
   return { page, controller, recorded: () => recorded };
 }
 
+test('主页弹层关闭后残留播放器不冒充当前视频，modal_id存在时仍识别作品', async t => {
+  const body = '<div data-e2e="user-info"><h1>合成作者</h1></div><div data-e2e="user-post-list"><a href="/video/111">1 合成作品</a></div>' + videoMarkup('111');
+  const grid = await fixture(t, { url: 'https://www.douyin.com/user/synthetic-author', body });
+  const gridState = await grid.page.evaluate(readPageState);
+  assert.equal(gridState.pageKind, 'user-profile'); assert.equal(gridState.video, null); assert.equal(gridState.userProfile.works[0].id, '111');
+  const modal = await fixture(t, { url: 'https://www.douyin.com/user/synthetic-author?modal_id=111', body });
+  const modalState = await modal.page.evaluate(readPageState);
+  assert.equal(modalState.pageKind, 'video'); assert.equal(modalState.video.id, '111'); assert.equal(modalState.userProfile.secUid, 'synthetic-author');
+});
+
 test('真实合成视频：未允许观看时拒绝播放，并直接暂停已有页面',async t=>{
   const {page,controller}=await fixture(t);
   const directory=fs.mkdtempSync(path.join(os.tmpdir(),'douyin-limits-core-'));

@@ -10,12 +10,12 @@ export const TOOL_DEFINITIONS = [
   },
   {
     name: 'douyin_open_video',
-    description: '打开刚刚读取的搜索结果，或用户提供的抖音公开视频链接。index 与 url 至少提供一个。',
+    description: '打开刚刚读取的搜索结果，或用户提供的抖音公开视频、图文链接。index 与 url 至少提供一个。',
     parameters: {
       type: 'object',
       properties: {
         index: { type: 'integer', minimum: 0, description: '已读取搜索结果中的 index。' },
-        url: { type: 'string', description: 'https://www.douyin.com/video/作品ID 公开链接。' },
+        url: { type: 'string', description: 'https://www.douyin.com/video/作品ID 或 https://www.douyin.com/note/作品ID 公开链接。' },
       },
       additionalProperties: false,
     },
@@ -146,7 +146,7 @@ export function validateToolArguments(definition, args) {
   if (definition.name === 'douyin_open_video') {
     if (args.index === undefined && args.url === undefined) throw new TypeError('打开作品需要 index 或 url。');
     if (args.index !== undefined && args.index < 0) throw new RangeError('搜索结果 index 不能为负数。');
-    if (args.url !== undefined && !/^https:\/\/(?:www\.)?douyin\.com\/video\/\d+\/?(?:\?[^#]*)?(?:#.*)?$/.test(args.url)) throw new TypeError('作品链接必须是抖音公开 video 链接。');
+    if (args.url !== undefined && !/^https:\/\/(?:www\.)?douyin\.com\/(?:video|note)\/\d+\/?(?:\?[^#]*)?(?:#.*)?$/.test(args.url)) throw new TypeError('作品链接必须是抖音公开 video 或 note 链接。');
   }
   if (definition.name === 'douyin_open_user') {
     if (args.secUid === undefined && args.url === undefined) throw new TypeError('打开用户主页需要 secUid 或 url。');

@@ -553,7 +553,10 @@ export function readPageState() {
   }
   const u = new URL(location.href);
   for (const key of [...u.searchParams.keys()]) if (!['modal_id','aweme_id','recommend'].includes(key)) u.searchParams.delete(key);
-  const pageKind = liveRoom?'live-room':livePreview ? 'live-preview' : imagePost ? 'image-post' : video?.id ? 'video' : userProfile ? 'user-profile' : location.pathname.startsWith('/search/') ? (userSearchResults.length ? 'user-search' : 'search') : 'unknown';
+  // 关闭主页弹层后，残留播放器不能再把作品网格误报为视频详情。
+  const profileGrid = Boolean(userProfile && !u.searchParams.has('modal_id') && !u.searchParams.has('aweme_id'));
+  if (profileGrid) video = null;
+  const pageKind = liveRoom?'live-room':livePreview ? 'live-preview' : profileGrid ? 'user-profile' : imagePost ? 'image-post' : video?.id ? 'video' : userProfile ? 'user-profile' : location.pathname.startsWith('/search/') ? (userSearchResults.length ? 'user-search' : 'search') : 'unknown';
   return { url: u.href, title: document.title, video, imagePost, liveRoom, videoSelection: { candidateCount: videoElements.length, ambiguous: videoElements.length > 1 || videoIdentityConflict, identityConflict: videoIdentityConflict }, pageKind, livePreview, searchResults: searchResults.slice(0,20), userSearchResults: userSearchResults.slice(0,20), userProfile, visibleText: directLive?'':text,
     loginRequired, verificationRequired, privateChatVisible, documentReadyState: document.readyState };
 }
@@ -896,10 +899,11 @@ export class BrowserController {
     });
     this.queue=operation;return operation;
   }
-  execute(name, args = {}, { signal, humanAuthorized = false, autonomousRunId, expectedVideoId, expectedImageKey, advanceImage=false, expectedLiveRoomId, expectedLivePreviewKey, enterLive=false, exitLive=false, sharedCaptureMode } = {}) {
+  execute(name, args = {}, { signal, humanAuthorized = false, autonomousRunId, expectedVideoId, expectedImageKey, advanceImage=false, expectedLiveRoomId, expectedLivePreviewKey, enterLive=false, exitLive=false, sharedCaptureMode, profileWork=false } = {}) {
     const definition = TOOL_DEFINITIONS.find(tool=>tool.name===name);
     if (!definition) return Promise.reject(new Error('不支持的抖音工具。'));
     if (sharedCaptureMode !== undefined && (sharedCaptureMode !== SHARED_CAPTURE_MODE || name !== 'douyin_observe')) return Promise.reject(new Error('内部分享采样模式未由宿主授权。'));
+    if(profileWork!==false&&(profileWork!==true||name!=='douyin_open_video'||!args.url))return Promise.reject(new TypeError('主页弹层打开只能由自主观看绑定已读取的作品链接。'));
     try {
       if(sharedCaptureMode===SHARED_CAPTURE_MODE){if(!args||typeof args!=='object'||Array.isArray(args)||Object.keys(args).some(key=>key!=='seconds')||!Number.isFinite(args.seconds)||args.seconds<0.2||args.seconds>30)throw new TypeError('本机分享视频单批采集参数无效。');}
       else validateToolArguments(definition,args);
@@ -1003,11 +1007,46 @@ export class BrowserController {
         if (name==='douyin_search_user') await this.navigate(`https://www.douyin.com/search/${encodeURIComponent(args.query)}?type=user`,signal);
         if (name==='douyin_open_user') {
           const userUrl = args.url || `https://www.douyin.com/user/${args.secUid}`;
-          await this.navigate(userUrl,signal);
+          const targetSecUid = args.secUid || /^https:\/\/www\.douyin\.com\/user\/([^/?#]+)/.exec(userUrl)?.[1];
+          const currentUrl = new URL(this.page.url());
+          // 已在这个作者主页的作品弹层中时，优先按 Esc 返回作品列表，避免重新加载主页。
+          if(targetSecUid&&currentUrl.origin==='https://www.douyin.com'&&currentUrl.pathname===`/user/${targetSecUid}`&&currentUrl.searchParams.has('modal_id')) {
+            await this.page.keyboard.press('Escape');
+            let closed=false;
+            for(let attempt=0;attempt<12;attempt++) {
+              await wait(250,signal);
+              const state=await this.state({record:false}),url=new URL(state.url);
+              if(url.pathname===`/user/${targetSecUid}`&&!url.searchParams.has('modal_id')&&state.userProfile?.secUid===targetSecUid){closed=true;break;}
+            }
+            if(!closed)await this.navigate(userUrl,signal);
+          } else await this.navigate(userUrl,signal);
         }
         if (name==='douyin_open_video') {
           if (args.url) {
-            const noteId=/\/note\/(\d+)/.exec(args.url)?.[1], videoId2=/\/video\/(\d+)/.exec(args.url)?.[1];
+            const noteId=/\/note\/(\d+)/.exec(args.url)?.[1], videoId2=/\/video\/(\d+)/.exec(args.url)?.[1],workId2=noteId||videoId2;
+            if(profileWork) {
+              // 自主观看：只点击当前主页作品区里 ID 完全匹配的封面，并核对弹层身份。
+              try {
+                const before=await this.state({record:false});
+                if(before.pageKind!=='user-profile'||!before.userProfile?.works?.some(item=>item.id===workId2))throw new Error('当前页面不是包含该作品的作者主页。');
+                const anchors=this.page.locator('[data-e2e="user-post-list"] a[href*="/video/"],[data-e2e="user-post-list"] a[href*="/note/"]').filter({visible:true});
+                const hrefs=await anchors.evaluateAll(nodes=>nodes.map(node=>node.href));
+                const matches=hrefs.map((href,index)=>{try{return new URL(href).pathname.match(/\/(?:video|note)\/(\d+)/)?.[1]===workId2?index:-1;}catch{return -1;}}).filter(index=>index>=0);
+                if(matches.length!==1)throw new Error('主页中没有唯一的目标作品封面。');
+                await anchors.nth(matches[0]).click();
+                for(let attempt=0;attempt<24;attempt++) {
+                  await wait(250,signal);
+                  const opened=await this.state({record:false}),openedId=opened.video?.id||opened.imagePost?.id;
+                  const imageReady=opened.pageKind==='image-post'&&opened.imagePost?.recognized===true&&opened.imagePost?.loaded===true;
+                  if(new URL(opened.url).searchParams.get('modal_id')===workId2&&openedId===workId2&&(opened.video?.readyState>=2||imageReady))return opened;
+                  if(opened.loginRequired||opened.verificationRequired)throw Object.assign(new Error('打开作品弹层后需要登录或验证。'),{code:'PROFILE_MODAL_NEEDS_USER',watchStatus:'needs_user'});
+                }
+                throw new Error('点击封面后未读到目标作品弹层。');
+              } catch(error) {
+                if(signal?.aborted||error.code==='PROFILE_MODAL_NEEDS_USER')throw error;
+                throw Object.assign(new Error(`主页作品弹层未能打开：${error.message}`),{code:'PROFILE_MODAL_FAILED'});
+              }
+            }
             if(noteId) await this.navigate(`https://www.douyin.com/note/${noteId}`,signal);
             else if(videoId2) await this.navigate(`https://www.douyin.com/video/${videoId2}`,signal);
             else throw new Error('作品链接无效，请重新搜索或从主页选择。');

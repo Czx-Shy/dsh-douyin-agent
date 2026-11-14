@@ -196,11 +196,11 @@ export class AutonomousWatch {
       this.save({lastSwitchDiagnostic:switchFailureDiagnostic({name,output,error,source:this.source,runId:this.runId,now:this.now(),startedAt,expectedVideoId,stage})});
     } catch { try { this.onEvent({type:'watch.diagnostic_failed',message:'换片诊断未能保存。'}); } catch {} }
   }
-  async execute(name, args = {}, { expectedVideoId, expectedImageKey,advanceImage=false,expectedLiveRoomId,expectedLivePreviewKey,enterLive=false,exitLive=false, allowLoading = false } = {}) {
+  async execute(name, args = {}, { expectedVideoId, expectedImageKey,advanceImage=false,expectedLiveRoomId,expectedLivePreviewKey,enterLive=false,exitLive=false, allowLoading = false, profileWork = false } = {}) {
     this.assertAllowed();
     const startedAt = this.now();
     let output;
-    try { output = await this.controller.execute(name, args, { signal: this.abort.signal, autonomousRunId: this.runId, ...(expectedVideoId === undefined ? {} : { expectedVideoId }),...(expectedImageKey?{expectedImageKey,advanceImage}:{}),...(expectedLiveRoomId?{expectedLiveRoomId,enterLive,exitLive}:{}),...(expectedLivePreviewKey?{expectedLivePreviewKey}:{}) }); }
+    try { output = await this.controller.execute(name, args, { signal: this.abort.signal, autonomousRunId: this.runId, ...(expectedVideoId === undefined ? {} : { expectedVideoId }),...(expectedImageKey?{expectedImageKey,advanceImage}:{}),...(expectedLiveRoomId?{expectedLiveRoomId,enterLive,exitLive}:{}),...(expectedLivePreviewKey?{expectedLivePreviewKey}:{}),...(profileWork?{profileWork:true}:{}) }); }
     catch (error) { this.recordSwitchFailure(name,null,{error,startedAt,expectedVideoId}); throw error; }
     if (output?.changed !== true) this.recordSwitchFailure(name,output,{startedAt,expectedVideoId});
     this.assertAllowed();
@@ -345,8 +345,14 @@ export class AutonomousWatch {
         if (this.invalidDecisionStreak >= 3) throw failure('连续三次未取得有效观看决策，已停止本次观看；今日用量保留。');
         return { current: await this.execute('douyin_open', {}, { allowLoading: true }) };
       }
+      try {
+        current = await this.execute('douyin_open_video', { url: work.url }, { allowLoading: true, profileWork: true });
+      } catch (error) {
+        if (error.code !== 'PROFILE_MODAL_FAILED') throw error;
+        this.onEvent({ type: 'watch.profile-modal-fallback', workId: work.id, message: '主页作品弹层未能打开，改用作品直链。' });
+        current = await this.execute('douyin_open_video', { url: work.url }, { allowLoading: true });
+      }
       this.profileSession.watched.push(work.id);
-      current = await this.execute('douyin_open_video', { url: work.url }, { allowLoading: true });
       return { current };
     }
     if (decision.action === 'message_author') {
