@@ -9,7 +9,7 @@ import { MemoryStore } from './memory.mjs?v=2';
 import { TOOL_DEFINITIONS, validateToolArguments } from './tool-definitions.mjs?v=18';
 import { VideoLimits } from './video-limits.mjs';
 import { resolveRuntimePaths, resolveNodeExecutable } from './runtime-paths.mjs?v=10';
-import { PersonaMemory } from './persona-memory.mjs?v=10';
+import { PersonaMemory } from './persona-memory.mjs?v=11';
 import { BrowserLauncher, connectDedicatedBrowser } from './browser-launcher.mjs';
 import { pauseExistingVideoPages } from './browser-pause.mjs';
 import { browserPageLabel, browserPageLock, findSharedPage, adoptSharedPreparePage } from './browser-pages.mjs';
@@ -306,6 +306,11 @@ export function readPageState() {
   };
   const clean = value => (value ?? '').replace(/\s+/g, ' ').trim();
   const boundedAuthor = value => { const name = clean(value).replace(/^@\s*/, ''); return name && name.length <= 256 && !name.includes('\0') ? name : null; };
+  // 页面文案会把“展开相关搜索/展开合集/识别画面”等界面文字拼进标题，读到模型前先去掉这些尾巴。
+  const stripTitleUi = value => clean(value)
+    .replace(/(?:展开相关搜索|展开合集|展开全部|展开简介)[：:][\s\S]*$/u, '')
+    .replace(/(?:识别画面|展开)$/u, '')
+    .trim();
   const workId = value => {
     try { const u = new URL(value, location.href); return /\/(?:video|note)\/(\d+)/.exec(u.pathname)?.[1] || u.searchParams.get('modal_id') || u.searchParams.get('aweme_id'); } catch { return null; }
   };
@@ -355,7 +360,7 @@ export function readPageState() {
       }
       return best;
     };
-    const userLinks = links.filter(e => /\/user\//.test(e.getAttribute('href') || ''));
+    const userLinks = links.filter(e => /\/user\//.test(e.getAttribute('href') || '') && !/\/user\/self\/?$/.test(e.getAttribute('href') || '') && clean(e.textContent) !== '我的');
     // 详情页作者区优先，其次是评论和推荐区之外的链接，最后才按原有顺序兜底。
     const authorElement = userLinks.find(e => e.closest('[data-e2e="user-info"]')) || userLinks.find(e => !e.closest(nonAuthorArea)) || userLinks[0] || nearestUserLink() || [...(container?.querySelectorAll('span,div')??[])].find(e=>e.childElementCount===0 && /^@/.test(clean(e.textContent)) && visible(e));
     const authorSecUid = authorElement ? /\/user\/([A-Za-z0-9_-]+)/.exec(authorElement.getAttribute?.('href') || authorElement.href || '')?.[1] ?? null : null;
@@ -368,7 +373,7 @@ export function readPageState() {
     video = { id, url: id ? `https://www.douyin.com/video/${id}` : null,
       author: boundedAuthor(authorElement?.textContent) || boundedAuthor(detailAuthor) || boundedAuthor(captionAuthor),
       authorSecUid,
-      title: (clean(titleElement?.getAttribute('data-e2e')==='detail-video-info'?titleElement.innerText.split('\n')[0]:titleElement?.textContent) || clean(links.find(e=>workId(e.href))?.textContent)).slice(0, 1000) || null,
+      title: (stripTitleUi(titleElement?.getAttribute('data-e2e')==='detail-video-info'?titleElement.innerText.split('\n')[0]:titleElement?.textContent) || stripTitleUi(links.find(e=>workId(e.href))?.textContent)).slice(0, 1000) || null,
       time: element.currentTime, duration: Number.isFinite(element.duration) ? element.duration : null,
       paused: element.paused, muted: element.muted, readyState: element.readyState, ended:element.ended, loop:element.loop,
       width: element.videoWidth, height: element.videoHeight,
@@ -413,7 +418,11 @@ export function readPageState() {
       }
       const validCount=!index||!total||index<=total;
       const imageAuthor=[...activeContainer.querySelectorAll('a[href*="/user/"]')].find(link=>visible(link));
-      imagePost={id,url:`https://www.douyin.com/note/${id}`,recognized:true,source:'active-image-element',loaded:true,title:clean(activeContainer.querySelector('[data-e2e="video-desc"],[data-e2e="video-title"],[class*="video-info-detail"]')?.textContent).slice(0,1000)||null,
+      // 图文详情页的文案有时不在 video-desc 里，退回页面标题（去掉“ - 抖音”后缀），作者优先取可见作者链接。
+      const imageTitle=clean(activeContainer.querySelector('[data-e2e="video-desc"],[data-e2e="video-title"],[class*="video-info-detail"]')?.textContent)
+        || stripTitleUi(clean(document.title||'').replace(/\s*[-–]\s*抖音\s*$/u,''));
+      imagePost={id,url:`https://www.douyin.com/note/${id}`,recognized:true,source:'active-image-element',loaded:true,title:imageTitle.slice(0,1000)||null,
+        author:boundedAuthor(imageAuthor?.textContent)||boundedAuthor(/@([^\n·]+)/.exec(clean(activeContainer.innerText))?.[1]),
         authorSecUid:imageAuthor?/\/user\/([A-Za-z0-9_-]+)/.exec(imageAuthor.getAttribute('href')||'')?.[1]??null:null,
         width:image.naturalWidth,height:image.naturalHeight,viewport:{x:Math.max(0,r.left),y:Math.max(0,r.top),width:Math.min(innerWidth,r.right)-Math.max(0,r.left),height:Math.min(innerHeight,r.bottom)-Math.max(0,r.top)},imageKey:marker((image.currentSrc||image.src)+'\0'+image.naturalWidth+'x'+image.naturalHeight+'\0'+(index||0)),album:{index:validCount?index:null,total:validCount?total:null,hasNext:validCount&&next.length===1&&!(index&&total&&index>=total),atEnd:Boolean(validCount&&index&&total&&index>=total),source:'visible-carousel-dom'},observationScope:'current-visible-image'};
     }
@@ -454,19 +463,23 @@ export function readPageState() {
     for (const candidate of candidates) {
       const anchor = candidate.matches('a') ? candidate : candidate.querySelector('a[href*="/video/"],a[href*="modal_id="]');
       const id = workId(anchor?.href) || candidate.getAttribute('data-aweme-id') || /waterfall_item_(\d+)/.exec(candidate.closest('[id^="waterfall_item_"]')?.id??'')?.[1];
+      // 用户标签页的卡片没有作品链接，不能当成视频结果；“相关搜索”区块也不是作品。
+      if (!id || used.has(id)) continue;
       const card = candidate.closest('.search-result-card,[data-e2e="search-card"],[data-e2e="search-result"]') || candidate;
+      if (card.matches('[data-e2e*="related-search"],[class*="relatedSearch"],[class*="related-search"]')) continue;
       const leaves = [...card.querySelectorAll('div,span')].filter(e=>!e.childElementCount).map(e=>clean(e.textContent));
-      const title = clean(card.querySelector('[data-e2e="video-desc"],[data-e2e="video-title"]')?.textContent) || leaves.sort((a,b)=>b.length-a.length)[0] || clean(card.textContent);
-      if (!title || used.has(id || title)) continue;
-      used.add(id || title);
-      searchResults.push({ index: searchResults.length, id: id || null, url: id ? `https://www.douyin.com/video/${id}` : null,
+      const title = stripTitleUi(card.querySelector('[data-e2e="video-desc"],[data-e2e="video-title"]')?.textContent) || stripTitleUi(leaves.sort((a,b)=>b.length-a.length)[0]) || stripTitleUi(card.textContent);
+      if (!title || /^相关搜索/.test(title)) continue;
+      used.add(id);
+      searchResults.push({ index: searchResults.length, id, url: `https://www.douyin.com/video/${id}`,
         title: title.slice(0,1000), author: boundedAuthor(card.querySelector('a[href*="/user/"]')?.textContent) || boundedAuthor(/@([^\n·]+)/.exec(card.innerText)?.[1]) });
     }
   }
   // 用户搜索结果：搜索页中可见的用户卡片
   const userSearchResults = [];
   if (location.pathname.startsWith('/search/')) {
-    const userCards = [...document.querySelectorAll('.search-result-card')].filter(card => card.querySelector('a[href*="/user/"]') && visible(card));
+    // 只有“没有作品链接”的卡片才是用户结果；视频结果卡片也带作者链接，不能混进用户列表。
+    const userCards = [...document.querySelectorAll('.search-result-card')].filter(card => card.querySelector('a[href*="/user/"]') && !card.querySelector('a[href*="/video/"],a[href*="/note/"],a[href*="modal_id="]') && visible(card));
     const seenUsers = new Set();
     const parseCount = (text) => {
       const m = /([\d.]+)\s*(万|亿)?/.exec(text || '');
@@ -489,8 +502,10 @@ export function readPageState() {
       for (const t of leaves.slice(from)) {
         if (/(?:获赞|粉丝)$/.test(t)) break;
         if (/抖音号/.test(t)) continue;
-        if (!/^[A-Za-z0-9_-]+$/.test(t)) break;
-        idParts.push(t);
+        // 抖音号可能带句点或前后标点，去掉尾部的句点后再判断字符集。
+        const text = t.replace(/^[.。:：]+|[.。:：]+$/gu, '');
+        if (!/^[A-Za-z0-9_.-]+$/.test(text)) break;
+        idParts.push(text);
         if (idParts.join('').length >= 30) break;
       }
       const douyinId = idParts.join('') || null;
@@ -509,8 +524,17 @@ export function readPageState() {
   const userSecUid = location.pathname.startsWith('/user/') ? /^\/user\/([A-Za-z0-9_-]+)/.exec(location.pathname)?.[1] : null;
   if (userSecUid && !loginRequired && !verificationRequired && !privateChatVisible) {
     const profileRoot = document.querySelector('[data-e2e="user-info"],[class*="userInfo"],[class*="user-info"],main') || document.body;
-    // 统计信息从整页文本提取，避免部分账号的资料区不在同一个容器内
-    const statsText = clean(document.body.textContent);
+    // 统计信息只取同时包含“关注/粉丝/获赞”的最短容器，避免整页隐藏文本里的同名词条抢先命中。
+    const statsText = (() => {
+      const roots = [profileRoot, ...document.querySelectorAll('[data-e2e="user-info"],[class*="userInfo"],[class*="user-info"],[class*="user-detail"],[class*="userDetail"]')].filter(Boolean);
+      let best = '';
+      for (const root of roots) {
+        const value = clean(root.textContent ?? '');
+        if (!/关注/.test(value) || !/粉丝/.test(value) || !/获赞/.test(value)) continue;
+        if (!best || value.length < best.length) best = value;
+      }
+      return best || clean(document.body.textContent);
+    })();
     const parseCount = (num, unit) => {
       const n = Number(num);
       if (!Number.isFinite(n)) return null;
@@ -520,9 +544,9 @@ export function readPageState() {
     const nicknameLeaf = [...profileRoot.querySelectorAll('*')].filter(el => el.childElementCount === 0).map(el => clean(el.textContent)).find(t => t && t.length <= 60 && !/^(?:关注|已关注|相互关注|私信|发消息)$/.test(t));
     const titleMatch = /^(.+?)(?:的主页)?\s*[-–]\s*抖音/.exec(document.title || '');
     const nickname = (nicknameLeaf || titleMatch?.[1] || '').slice(0, 100) || null;
-    // 关注数：关注与粉丝之间
-    const followingMatch = /关注\s*(\d+)\s*粉丝/.exec(statsText);
-    const followingCount = followingMatch ? Number(followingMatch[1]) : null;
+    // 关注数：关注与粉丝之间（可带万/亿）
+    const followingMatch = /关注\s*([\d.]+)\s*(万|亿)?\s*粉丝/.exec(statsText);
+    const followingCount = followingMatch ? parseCount(followingMatch[1], followingMatch[2]) : null;
     // 粉丝数：粉丝与获赞之间（可带万/亿）
     const followerMatch = /粉丝\s*([\d.]+)\s*(万|亿)?\s*获赞/.exec(statsText);
     const followerCount = followerMatch ? parseCount(followerMatch[1], followerMatch[2]) : null;
@@ -539,7 +563,8 @@ export function readPageState() {
     // 作品列表：只取主页作品区，避免把页脚推荐或 SEO 链接误当成本人作品
     const works = [];
     const worksRoot = document.querySelector('[data-e2e="user-post-list"]');
-    const workAnchors = worksRoot ? [...worksRoot.querySelectorAll('a[href*="/video/"],a[href*="/note/"]')].filter(a => visible(a)).slice(0, 30) : [];
+    const allWorkAnchors = worksRoot ? [...worksRoot.querySelectorAll('a[href*="/video/"],a[href*="/note/"]')].filter(a => visible(a)) : [];
+    const workAnchors = allWorkAnchors.slice(0, 30);
     const seenWorks = new Set();
     for (const anchor of workAnchors) {
       const id = workId(anchor.href);
@@ -551,14 +576,14 @@ export function readPageState() {
       const likeAndTitle = /^([\d.]+)\s*(万|亿)?\s*(.+)$/.exec(rest);
       // 作品卡片的无障碍文本会把标题重复一遍，等长前后半段相同时收敛为一份
       const dedupe = text => text.length % 2 === 0 && text.slice(0, text.length / 2) === text.slice(text.length / 2) ? text.slice(0, text.length / 2) : text;
-      const title = dedupe((likeAndTitle?.[3] || rest).trim()).slice(0, 200) || null;
+      const title = stripTitleUi(dedupe((likeAndTitle?.[3] || rest).trim())).slice(0, 200) || null;
       const likeCount2 = likeAndTitle ? parseCount(likeAndTitle[1], likeAndTitle[2]) : null;
       works.push({ id, url: `https://www.douyin.com/${/\/note\//.test(anchor.href) ? 'note' : 'video'}/${id}`, title, likeCount: likeCount2 });
     }
-    userProfile = { secUid: userSecUid, nickname, douyinId, followerCount, followingCount, likeCount, bio, verified, works };
+    userProfile = { secUid: userSecUid, nickname, douyinId, followerCount, followingCount, likeCount, bio, verified, works, worksTruncated: allWorkAnchors.length > workAnchors.length };
   }
   const u = new URL(location.href);
-  for (const key of [...u.searchParams.keys()]) if (!['modal_id','aweme_id','recommend'].includes(key)) u.searchParams.delete(key);
+  for (const key of [...u.searchParams.keys()]) if (!['modal_id','aweme_id','recommend','type'].includes(key)) u.searchParams.delete(key);
   // 关闭主页弹层后，残留播放器不能再把作品网格误报为视频详情。
   const profileGrid = Boolean(userProfile && !u.searchParams.has('modal_id') && !u.searchParams.has('aweme_id'));
   if (profileGrid) video = null;
@@ -699,7 +724,7 @@ export class BrowserController {
   }
   store() { return this.memory ??= new MemoryStore(resolveRuntimePaths().memoryDbPath); }
   async observeSharedWork(input) {
-    const { AutonomousWatch } = await import('./autonomous-watch.mjs?v=20');
+    const { AutonomousWatch } = await import('./autonomous-watch.mjs?v=21');
     const release = await lock('chat-shared-video', input.signal, this.controlDirectory);
     try {
       return await observeChatSharedWork({ ...input, videoLimits: this.limits(),
@@ -716,7 +741,7 @@ export class BrowserController {
     return this.personaMemory;
   }
   getChatService() {
-    this.chatPromise??=Promise.all([import('./chat-browser.mjs?v=18'),import('./chat-service.mjs?v=18'),import('./usage-ledger.mjs')])
+    this.chatPromise??=Promise.all([import('./chat-browser.mjs?v=18'),import('./chat-service.mjs?v=19'),import('./usage-ledger.mjs')])
       .then(([{ChatBrowser},{ChatService},{UsageLedger}])=>{const stateDir=this.limits().stateDir,source=this.source==='dsh'?'dsh':'api';const service=new ChatService({stateDir,browser:new ChatBrowser({source:source==='dsh'?'dsh-chat':'api-chat'}),onPrepared:options=>this.releaseIdlePreparePage(options),observeSharedWork:input=>this.observeSharedWork(input),videoLimits:this.limits()});service.agent.personaMemory=this.getPersonaMemory();service.agent.getMemoryStore=()=>this.store();service.agent.createConversationMemory=({scopeToken,messages})=>{const contact=memoryContactFromToken(scopeToken);return createRuntimeConversationMemory({store:this.store(),contact,messages,host:source==='dsh'?'dsh':'desktop',isAuthorized:()=>service.isMemoryScopeAuthorized(contact)});};service.agent.usageLedger=new UsageLedger({stateDir});service.agent.source=source;return service;})
       .catch(error=>{this.chatPromise=null;throw error;});
     return this.chatPromise;
@@ -726,7 +751,7 @@ export class BrowserController {
     return this.sparkPromise;
   }
   getCommenter() {
-    this.commenterPromise ??= import('./comment-browser.mjs?v=19').then(({ CommentBrowser }) => new CommentBrowser({ source: this.source === 'dsh' ? 'dsh' : 'api', videoLimits: this.limits(), stateDir: this.limits().stateDir })).catch(error => { this.commenterPromise = null; throw error; });
+    this.commenterPromise ??= import('./comment-browser.mjs?v=20').then(({ CommentBrowser }) => new CommentBrowser({ source: this.source === 'dsh' ? 'dsh' : 'api', videoLimits: this.limits(), stateDir: this.limits().stateDir })).catch(error => { this.commenterPromise = null; throw error; });
     return this.commenterPromise;
   }
   getComments() {
@@ -740,7 +765,7 @@ export class BrowserController {
     const videoId = state.video?.id;
     if (!/^\d{10,30}$/.test(videoId || '')) throw new Error('当前没有可核对的作品，未读取评论。');
     if (state.loginRequired || state.verificationRequired || state.blocked || state.privateChatVisible || state.unsupportedPage) throw Object.assign(new Error('页面需要手动处理，未读取评论。'), { watchStatus: 'needs_user' });
-    const { ensureCommentPanel, readCommentDom, readCommentSelfIdentity } = await import('./comment-browser.mjs?v=18');
+    const { ensureCommentPanel, readCommentDom, readCommentSelfIdentity } = await import('./comment-browser.mjs?v=20');
     const identity = await this.page.evaluate(readCommentSelfIdentity);
     signal?.throwIfAborted();
     if (!identity.ready) throw Object.assign(new Error('登录本人身份缺失或冲突，未读取评论。'), { needsUserAction: true, reasonCode: identity.reasonCode });
@@ -887,6 +912,7 @@ export class BrowserController {
     await this.settle(signal, {kind:targetId?'video':targetUser?'user':url.includes('/search/')?'search':'recommend',videoId:targetId});
   }
   async settle(signal, {kind='recommend',videoId}={}) {
+    let userWaited = 0;
     for (let i=0;i<=60;i++) {
       aborted(signal);
       const state = await this.evaluatePage(readPageState,undefined,signal);
@@ -896,7 +922,12 @@ export class BrowserController {
       const imageReady=state.pageKind==='image-post'&&state.imagePost?.recognized===true&&state.imagePost.source==='active-image-element'&&state.imagePost.loaded===true;
       if(kind==='search' && state.searchResults.length && !detail) return state;
       if(kind==='search' && /暂无搜索结果|没有找到相关|暂无结果/.test(state.visibleText)) return state;
-      if(kind==='user' && state.pageKind==='user-profile' && state.userProfile) return state;
+      // 主页资料与作品列表都在首屏异步渲染：作品为空时再多等 3 秒，避免把“还没渲染”当成“没有作品”。
+      if(kind==='user' && state.pageKind==='user-profile' && state.userProfile) {
+        const emptyProfile=/暂无作品|还未发布|还没有作品|暂未发布|没有作品/.test(state.visibleText||'');
+        if(state.userProfile.works?.length || emptyProfile) return state;
+        if(++userWaited >= 6) return state;
+      }
       if(kind==='video' && detail && (state.video?.id===videoId && state.video.readyState>=2 || imageReady&&state.imagePost.id===videoId)) return state;
       if(kind==='recommend' && (state.video?.id && state.video.readyState>=2 || imageReady || state.livePreview?.recognized === true)) return state;
       if(i<60)await wait(500, signal);
@@ -971,7 +1002,14 @@ export class BrowserController {
       }
       if(name==='douyin_message_user') {
         const outbound=await this.getOutboundMessageService();aborted(signal);
-        return outbound.sendToUser(args,{signal});
+        // 私信同样会导航专用页面：取得与观看/回复相同的跨进程页面锁，并先建立连接再发送。
+        const releaseMessage=await lock(browserPageLock(this.source),signal,this.controlDirectory);
+        try {
+          await this.connect(signal);
+          aborted(signal);
+          if (['api', 'dsh'].includes(this.source)) await (await this.getWatchMode()).apply(this.page);
+          return await outbound.sendToUser(args,{signal});
+        } finally { releaseMessage(); }
       }
       if(name.startsWith('douyin_chat_')) {
         const chat=await this.getChatService();aborted(signal);
@@ -999,7 +1037,7 @@ export class BrowserController {
       if (name==='douyin_recall') return this.store().recall({query:args.query??'',limit:args.limit??10});
       if (name==='douyin_persona_status') return this.getPersonaMemory().snapshot();
       if (name==='douyin_watch_status') {
-        const {AutonomousWatch}=await import('./autonomous-watch.mjs?v=20');
+        const {AutonomousWatch}=await import('./autonomous-watch.mjs?v=21');
         this.watchStatusReader??=new AutonomousWatch({controller:this,config:{},videoLimits:this.limits(),personaMemory:this.getPersonaMemory(),source:this.source==='dsh'?'dsh':'api',stateDir:this.limits().stateDir});
         return this.watchStatusReader.state();
       }

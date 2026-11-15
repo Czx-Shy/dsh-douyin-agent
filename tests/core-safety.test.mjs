@@ -94,6 +94,53 @@ async function fixture(t, { url = 'https://www.douyin.com/video/111', body = vid
   return { page, controller, recorded: () => recorded };
 }
 
+test('用户搜索结果只收作品卡片，用户卡片和相关搜索不冒充视频', async t => {
+  const body = `<div class="search-result-card"><a href="/user/user-a" style="display:inline-block;width:60px;height:60px"></a><span>合成用户甲</span><span>关注</span><span>12345</span><span>1.2万获赞</span><span>345粉丝</span><span>合成简介</span></div>
+    <div class="search-result-card"><a href="/video/111" style="display:inline-block;width:200px;height:100px"><span>合成作品标题展开相关搜索：合成词识别画面</span></a><a href="/user/user-b">@合成作者乙</a></div>
+    <div class="search-result-card" data-e2e="related-search"><a href="/video/222">相关搜索合成词</a></div>`;
+  const f = await fixture(t, { url: 'https://www.douyin.com/search/%E5%90%88%E6%88%90?type=user', body });
+  const state = await f.page.evaluate(readPageState);
+  assert.equal(state.pageKind, 'user-search');
+  assert.equal(state.url.includes('type=user'), true);
+  assert.equal(state.userSearchResults.length, 1);
+  assert.equal(state.userSearchResults[0].nickname, '合成用户甲');
+  assert.equal(state.userSearchResults[0].douyinId, '12345');
+  assert.equal(state.userSearchResults[0].followerCount, 345);
+  assert.deepEqual(state.searchResults.map(item => item.id), ['111']);
+  // 标题里的“展开相关搜索/识别画面”属于界面文字，不能当作品文案。
+  assert.equal(state.searchResults[0].title, '合成作品标题');
+});
+
+test('主页统计只取资料区，不被隐藏文本里的“关注0粉丝”抢先命中', async t => {
+  const body = `<div style="display:none">关注0粉丝999获赞888</div>
+    <div data-e2e="user-info"><h1>合成作者</h1><div><span>关注</span><span>239</span><span>粉丝</span><span>35.0万</span><span>获赞</span><span>310.4万</span></div><span>抖音号：abc_123</span><span>IP属地：广东 27岁 广东·广州</span><span>合成简介文字</span></div>
+    <div data-e2e="user-post-list"><a href="/video/111" style="display:inline-block;width:100px;height:100px">1.2万 合成作品</a></div>`;
+  const f = await fixture(t, { url: 'https://www.douyin.com/user/synthetic-author', body });
+  const state = await f.page.evaluate(readPageState);
+  assert.equal(state.pageKind, 'user-profile');
+  assert.equal(state.userProfile.followingCount, 239);
+  assert.equal(state.userProfile.followerCount, 350000);
+  assert.equal(state.userProfile.likeCount, 3104000);
+  assert.equal(state.userProfile.douyinId, 'abc_123');
+  assert.equal(state.userProfile.nickname, '合成作者');
+  assert.equal(state.userProfile.works[0].id, '111');
+  assert.equal(state.userProfile.works[0].title, '合成作品');
+  assert.equal(state.userProfile.works[0].likeCount, 12000);
+  assert.equal(state.userProfile.worksTruncated, false);
+});
+
+test('打开主页会等作品列表渲染后再返回，避免模型拿到空列表', async t => {
+  const body = `<div data-e2e="user-info"><h1>合成作者</h1><div><span>关注</span><span>2</span><span>粉丝</span><span>3</span><span>获赞</span><span>4</span></div></div><div data-e2e="user-post-list"></div>`;
+  const f = await fixture(t, { url: 'https://www.douyin.com/user/synthetic-author', body });
+  const started = Date.now();
+  await f.page.evaluate(() => { setTimeout(() => { document.querySelector('[data-e2e="user-post-list"]').innerHTML = '<a href="/video/111" style="display:inline-block;width:100px;height:100px">合成作品</a>'; }, 1200); });
+  const state = await f.controller.settle(undefined, { kind: 'user' });
+  assert.equal(state.pageKind, 'user-profile');
+  assert.equal(state.userProfile.works.length, 1);
+  assert.equal(state.userProfile.works[0].id, '111');
+  assert.ok(Date.now() - started >= 1000, '作品列表渲染前不能提前返回');
+});
+
 test('主页弹层关闭后残留播放器不冒充当前视频，modal_id存在时仍识别作品', async t => {
   const body = '<div data-e2e="user-info"><h1>合成作者</h1></div><div data-e2e="user-post-list"><a href="/video/111">1 合成作品</a></div>' + videoMarkup('111');
   const grid = await fixture(t, { url: 'https://www.douyin.com/user/synthetic-author', body });

@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { OutboundCoordinator } from './outbound-send.mjs';
 
@@ -32,6 +32,10 @@ function parseUserUrl(value) {
 
 function validatePolicy(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw fail('主动私信设置必须是对象。');
+  if (value.enabled !== undefined && typeof value.enabled !== 'boolean') throw fail('主动私信开关必须是布尔值。');
+  if (value.autoFollow !== undefined && typeof value.autoFollow !== 'boolean') throw fail('关注后自动关注必须是布尔值。');
+  if (value.dailyLimit !== undefined && !(Number.isSafeInteger(value.dailyLimit) && value.dailyLimit >= 1 && value.dailyLimit <= 50)) throw fail('每日主动私信上限须为 1 至 50 的整数。');
+  if (value.minIntervalSeconds !== undefined && !(Number.isSafeInteger(value.minIntervalSeconds) && value.minIntervalSeconds >= 10 && value.minIntervalSeconds <= 300)) throw fail('两次发送最小间隔须为 10 至 300 秒的整数。');
   const enabled = typeof value.enabled === 'boolean' ? value.enabled : DEFAULTS.enabled;
   const dailyLimit = Number.isSafeInteger(value.dailyLimit) && value.dailyLimit >= 1 && value.dailyLimit <= 50 ? value.dailyLimit : DEFAULTS.dailyLimit;
   const minIntervalSeconds = Number.isSafeInteger(value.minIntervalSeconds) && value.minIntervalSeconds >= 10 && value.minIntervalSeconds <= 300 ? value.minIntervalSeconds : DEFAULTS.minIntervalSeconds;
@@ -159,6 +163,8 @@ export class OutboundMessageService {
     let result, failure;
     try { result = await callback(() => { clicked = true; }); }
     catch (error) { failure = error; }
+    // 不论成功失败都收起私信弹窗：覆盖层会让后续自主观看判定“需要用户处理”。
+    try { await this._closeDmDialog(targetSecUid, signal); } catch { /* 收起失败不改变发送结果，交给后续状态检查。 */ }
     let settleError = null;
     try { await this._settle(reservationId, { sent: clicked }); }
     catch (error) {
@@ -179,6 +185,24 @@ export class OutboundMessageService {
     try {
       this._appendReceipt({ id: `settle-${reservationId}`, at: new Date().toISOString(), targetSecUid, status: 'settle-pending', sent, reason });
     } catch { /* 保留结算异常，交由 _withReservation 向上抛出 */ }
+  }
+
+  // 私信弹窗是覆盖层。发送结束后必须收起，否则后续观看会把它当成需要用户处理的遮挡。
+  // 先按 Esc 关闭；仍关不掉时回到作者主页，保证页面不带着弹窗进入后续操作。
+  async _closeDmDialog(targetSecUid, signal) {
+    const page = this.controller.page;
+    if (!page || (typeof page.isClosed === 'function' && page.isClosed())) return false;
+    const dialogVisible = () => page.locator('[data-e2e="im-dialog"]').first().isVisible().catch(() => false);
+    for (let attempt = 0; attempt < 4; attempt++) {
+      if (!(await dialogVisible())) return true;
+      await page.keyboard.press('Escape').catch(() => {});
+      await page.waitForTimeout(250);
+      if (signal?.aborted) return !(await dialogVisible());
+    }
+    if (!(await dialogVisible())) return true;
+    try { await this.controller.navigate(`https://www.douyin.com/user/${targetSecUid}`, signal); }
+    catch { return false; }
+    return !(await dialogVisible());
   }
 
   // 收据按行追加；只取最近 24 小时内、带目标身份且可解析的记录。
@@ -253,37 +277,38 @@ export class OutboundMessageService {
     // 打开私信：优先"发消息"，其次"私信"；页面未就绪时点击可能丢失，最多重试三次。
     const entry = page.locator('button:has-text("发消息"),[data-e2e="message-btn"],[class*="messageBtn"],button:has-text("私信"),a:has-text("私信"),[data-e2e="chat-btn"]').filter({ visible: true }).first();
     const editor = page.locator('[data-e2e="im-dialog"] [contenteditable="true"][data-slate-editor]').first();
-    let opened = false;
-    for (let attempt = 0; attempt < 3 && !opened; attempt++) {
-      if (!(await editor.isVisible().catch(() => false))) {
+    // Playwright 的 text= 会把 "=" 之后整段（含逗号）当成字面文本，多个提示必须分别匹配。
+    const followPrompt = page.getByText(/关注后(?:即可|才能)发送消息|请先关注对方/).filter({ visible: true }).first();
+    const openEditor = async attempts => {
+      for (let attempt = 0; attempt < attempts; attempt++) {
+        if (await editor.isVisible().catch(() => false)) return true;
         if (await entry.count() === 0) throw fail('未找到"发消息"入口，对方可能关闭了私信或页面结构已变化。', 404);
         await entry.click().catch(() => {});
+        await page.waitForTimeout(1200);
       }
-      await page.waitForTimeout(1500);
-      opened = await editor.isVisible().catch(() => false);
+      return editor.isVisible().catch(() => false);
+    };
+    let opened = await openEditor(3);
+    signal?.throwIfAborted();
+    // 关注受限时对话框不会打开：先按用户策略处理关注，再重试打开对话框。
+    if (!opened && await followPrompt.count() > 0) {
+      const policy = this.policy();
+      if (!policy.autoFollow) {
+        this._appendReceipt({ id: receiptId, at: startedAt, secUid: targetSecUid, targetSecUid, url: userUrl, nickname, messageChars: message.length, status: 'requires-follow', autoFollow: false });
+        throw fail('对方设置了关注后才能发消息，且自动关注未开启。', 403);
+      }
+      const followBtn = page.locator('button:has-text("关注"),[data-e2e="follow-btn"]').filter({ visible: true }).first();
+      const alreadyFollowed = page.locator('button:has-text("已关注"),button:has-text("相互关注")').filter({ visible: true });
+      if (await followBtn.count() === 0 && await alreadyFollowed.count() === 0) throw fail('需要关注但未找到关注按钮。', 404);
+      if (await alreadyFollowed.count() === 0) {
+        await followBtn.click();
+        await page.waitForTimeout(1200);
+        signal?.throwIfAborted();
+      }
+      opened = await openEditor(3);
     }
     signal?.throwIfAborted();
     if (!opened) throw fail('私信对话框未打开，可能对方不接收陌生人消息。', 403);
-
-    // 检测是否需要先关注
-    const followPrompt = page.locator('text=关注后即可发送消息,text=关注后才能发消息,text=请先关注对方').filter({ visible: true }).first();
-    if (await followPrompt.count() > 0) {
-      const policy = this.policy();
-      if (!policy.autoFollow) {
-        this._appendReceipt({ id: receiptId, at: startedAt, secUid: targetSecUid, targetSecUid, url: userUrl, nickname, messagePreview: message.slice(0, 50), status: 'requires-follow', autoFollow: false });
-        throw fail('对方设置了关注后才能发消息，且自动关注未开启。', 403);
-      }
-      // 点击关注按钮
-      const followBtn = page.locator('button:has-text("关注"),[data-e2e="follow-btn"]').filter({ visible: true }).first();
-      if (await followBtn.count() === 0) throw fail('需要关注但未找到关注按钮。', 404);
-      await followBtn.click();
-      await page.waitForTimeout(1000);
-      signal?.throwIfAborted();
-      // 再次尝试点击发消息
-      const retryButton = page.locator('button:has-text("发消息"),[data-e2e="message-btn"],button:has-text("私信")').filter({ visible: true }).first();
-      if (await retryButton.count() > 0) await retryButton.click();
-      await page.waitForTimeout(1200);
-    }
 
     // 核对当前会话对象，避免私信面板默认停在其他会话
     const activeTitle = (await page.locator('[data-e2e="im-dialog"] [class*="ChatHeadertitle"]').first().innerText().catch(() => '')).trim();
@@ -321,7 +346,9 @@ export class OutboundMessageService {
     if (await readEditor() !== message.trim()) throw fail('点击前草稿内容已变化，未发送。', 409);
 
     // 点击前先落盘“正在发送”，进程在点击后中断也能在下次识别为结果不明。
-    this._appendReceipt({ id: receiptId, at: startedAt, secUid: targetSecUid, targetSecUid, url: userUrl, nickname, messagePreview: message.slice(0, 80), status: 'clicking' });
+    // 收据只保留长度与哈希，不把私信正文写进本机文件。
+    const messageMeta = { messageChars: message.length, messageSha256: createHash('sha256').update(message).digest('hex') };
+    this._appendReceipt({ id: receiptId, at: startedAt, secUid: targetSecUid, targetSecUid, url: userUrl, nickname, ...messageMeta, status: 'clicking' });
     markClicked?.();
     await sendButton.click();
     signal?.throwIfAborted();
@@ -336,7 +363,7 @@ export class OutboundMessageService {
     const confirmed = !clearedDraft && appeared;
     this._appendReceipt({
       id: receiptId, at: startedAt, secUid: targetSecUid, targetSecUid, url: userUrl, nickname,
-      messagePreview: message.slice(0, 80), status: confirmed ? 'confirmed' : 'uncertain',
+      ...messageMeta, status: confirmed ? 'confirmed' : 'uncertain',
       deliveryUncertain: !confirmed, draftCleared: !clearedDraft, messageAppeared: appeared,
     });
 

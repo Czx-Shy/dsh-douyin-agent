@@ -225,17 +225,33 @@ export async function ensureCommentPanel(page, { check = async () => {}, signal 
 }
 
 // 只点击指定序号评论行里唯一的“回复”入口，并核对输入框确实进入回复状态。
+// 序号口径与读取端一致：只有顶层评论占位，楼中楼不参与计数，避免楼层展开后回复到别人。
 async function openCommentReply(page, replyToIndex, check, signal) {
   const deadline = Date.now() + 4000;
   let last = 'comment-reply-unavailable';
   while (Date.now() < deadline) {
     stop(signal); await check();
-    const rows = page.locator('[data-e2e="comment-item"]').filter({ visible: true });
-    if (await rows.count() >= replyToIndex) {
-      const row = rows.nth(replyToIndex - 1);
-      const reply = row.getByText('回复', { exact: true }).filter({ visible: true });
-      if (await reply.count() === 1) {
-        await reply.click();
+    const token = `comment-reply-${Math.random().toString(16).slice(2)}`;
+    const marked = await page.evaluate(({ index, token }) => {
+      const visible = element => {
+        const rect = element.getBoundingClientRect(), style = getComputedStyle(element);
+        return rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.right > 0 && rect.top < innerHeight && rect.left < innerWidth && style.display !== 'none' && style.visibility !== 'hidden';
+      };
+      for (const node of document.querySelectorAll('[data-deepseek-reply-token]')) node.removeAttribute('data-deepseek-reply-token');
+      const rows = [...document.querySelectorAll('[data-e2e="comment-item"]')].filter(visible);
+      const top = rows.filter(row => !row.parentElement?.closest('[data-e2e="comment-item"]'));
+      const row = top[index - 1];
+      if (!row) return { token: null, reason: top.length ? 'comment-reply-missing' : 'comment-reply-unavailable', topCount: top.length };
+      const buttons = [...row.querySelectorAll('button,span,div,a')].filter(element => element.childElementCount === 0 && (element.textContent || '').trim() === '回复' && visible(element));
+      if (buttons.length !== 1) return { token: null, reason: buttons.length > 1 ? 'comment-reply-ambiguous' : 'comment-reply-missing', topCount: top.length };
+      buttons[0].setAttribute('data-deepseek-reply-token', token);
+      return { token, topCount: top.length };
+    }, { index: replyToIndex, token });
+    if (marked?.reason) last = marked.reason;
+    const target = marked?.token ? page.locator(`[data-deepseek-reply-token="${token}"]`) : null;
+    try {
+      if (target && (await target.count()) === 1) {
+        await target.click();
         for (let attempt = 0; attempt < 12; attempt++) {
           await waitForCommentTick(250, undefined, { signal });
           stop(signal);
@@ -250,7 +266,8 @@ async function openCommentReply(page, replyToIndex, check, signal) {
         }
         throw new Error('点击回复后输入框没有进入回复状态，未输入。');
       }
-      last = await reply.count() > 1 ? 'comment-reply-ambiguous' : 'comment-reply-missing';
+    } finally {
+      await page.evaluate(currentToken => { for (const node of document.querySelectorAll('[data-deepseek-reply-token]')) if (node.getAttribute('data-deepseek-reply-token') === currentToken) node.removeAttribute('data-deepseek-reply-token'); }, token).catch(() => {});
     }
     await waitForCommentTick(250, undefined, { signal });
   }

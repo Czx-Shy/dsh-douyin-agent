@@ -121,7 +121,7 @@ export class AutonomousWatch {
     const request = read(this.files.stop, null), stopping = worker?.alive && request?.runId === worker.runId;
     const savedRunMatches = savedMatches && worker?.alive && Number.isFinite(worker.heartbeatAt) && this.now() - worker.heartbeatAt >= 0 && this.now() - worker.heartbeatAt < 5000;
     const ownRun = this.running && worker?.owned && worker.sessionId === this.sessionId && worker.source === this.source;
-    return redact({ protocol: 'autonomous-watch-v1', running: Boolean(worker?.alive), owned: Boolean(worker?.owned), worker, status: stopping ? 'stopping' : worker?.alive ? 'running' : ['running', 'stopping'].includes(selectedSaved.status) ? 'stopped' : selectedSaved.status || 'stopped', sessionId, counts: { ...counts, maxRequests:null, dailyRequests: time.daily?.requests ?? budget.days[day(this.now())] ?? 0, dailyLimit: time.policy.dailyRequests ?? null }, phase: ownRun ? this.phase || 'waiting' : savedRunMatches ? selectedSaved.phase || 'waiting' : 'idle', pendingRequests: ownRun ? this.pendingRequests || 0 : savedRunMatches && selectedSaved.pendingRequests === 1 ? 1 : 0, shareProgress: ownRun ? this.shareProgress || null : savedRunMatches ? readShareProgress(selectedSaved.shareProgress) : null, options: this.optionsService.state().policy, lastDecision: selectedSaved.lastDecision || null, lastError: selectedSaved.lastError || '', lastSwitchDiagnostic: readSwitchDiagnostic(selectedSaved.lastSwitchDiagnostic), remainingSeconds: time.allowed && time.session?.id === sessionId ? time.remainingSeconds : 0 }, [this.config.apiKey]);
+    return redact({ protocol: 'autonomous-watch-v1', running: Boolean(worker?.alive), owned: Boolean(worker?.owned), worker, status: stopping ? 'stopping' : worker?.alive ? 'running' : ['running', 'stopping'].includes(selectedSaved.status) ? 'stopped' : selectedSaved.status || 'stopped', sessionId, counts: { ...counts, maxRequests:null, dailyRequests: time.daily?.requests ?? budget.days[day(this.now())] ?? 0, dailyLimit: time.policy.dailyRequests ?? null }, phase: ownRun ? this.phase || 'waiting' : savedRunMatches ? selectedSaved.phase || 'waiting' : 'idle', pendingRequests: ownRun ? this.pendingRequests || 0 : savedRunMatches && selectedSaved.pendingRequests === 1 ? 1 : 0, shareProgress: ownRun ? this.shareProgress || null : savedRunMatches ? readShareProgress(selectedSaved.shareProgress) : null, options: this.optionsService.state().policy, lastDecision: selectedSaved.lastDecision || null, lastProfileDecision: selectedSaved.lastProfileDecision || null, lastError: selectedSaved.lastError || '', lastSwitchDiagnostic: readSwitchDiagnostic(selectedSaved.lastSwitchDiagnostic), remainingSeconds: time.allowed && time.session?.id === sessionId ? time.remainingSeconds : 0 }, [this.config.apiKey]);
   }
   save(value) { write(this.files.state, redact({ ...read(this.files.state, {}), ...value, source: this.source, sessionId: this.sessionId, runId:this.runId, updatedAt: new Date(this.now()).toISOString() }, [this.config.apiKey])); }
   assertAllowed() {
@@ -171,7 +171,7 @@ export class AutonomousWatch {
     });
     this.abort = new AbortController(); this.running = true; this.playbackClosed=false;this.phase='waiting';this.pendingRequests=0;this.startedDate = day(this.now());
     try {
-    this.save({ status: 'running', phase:'waiting',pendingRequests:0,lastError: '', lastDecision: null });
+    this.save({ status: 'running', phase:'waiting',pendingRequests:0,lastError: '', lastDecision: null, lastProfileDecision: null });
     this.heartbeat = setInterval(() => {
       try {
         const request = read(this.files.stop, null); if (request?.runId === this.runId) this.abort.abort(failure('用户停止自主观看。', 'stopped'));
@@ -326,11 +326,12 @@ export class AutonomousWatch {
     catch (error) {
       this.invalidDecisionStreak = (this.invalidDecisionStreak || 0) + 1;
       this.onEvent({ type: 'watch.profile-decision-rejected', code: error.code || 'PROFILE_DECISION_FORMAT', consecutive: this.invalidDecisionStreak, message: '主页模型决策无效，先回到推荐流。' });
-      this.save({ lastDecision: null, decisionRetry: { consecutive: this.invalidDecisionStreak, code: 'PROFILE_DECISION_FORMAT' } });
+      this.save({ lastProfileDecision: null, decisionRetry: { consecutive: this.invalidDecisionStreak, code: 'PROFILE_DECISION_FORMAT' } });
       if (this.invalidDecisionStreak >= 3) throw failure('连续三次未取得有效观看决策，已停止本次观看；今日用量保留。');
       return { current: await this.execute('douyin_open', {}, { allowLoading: true }) };
     }
-    this.invalidDecisionStreak = 0; this.save({ lastDecision: decision, usage: result.usage, decisionRetry: null });
+    // 主页决策是第二轮判断，写入独立字段，不覆盖观看循环的 lastDecision。
+    this.invalidDecisionStreak = 0; this.save({ lastProfileDecision: decision, usage: result.usage, decisionRetry: null });
     this.onEvent(redact({ type: 'watch.profile-decision', decision }, [this.config.apiKey]));
     current = await this.execute('douyin_status');
     state = current.state || current;
@@ -341,7 +342,7 @@ export class AutonomousWatch {
       if (!work) {
         this.invalidDecisionStreak = (this.invalidDecisionStreak || 0) + 1;
         this.onEvent({ type: 'watch.profile-decision-rejected', code: 'PROFILE_WORK_NOT_FOUND', consecutive: this.invalidDecisionStreak, message: '模型选择的作者作品不在主页列表，先回到推荐流。' });
-        this.save({ lastDecision: null, decisionRetry: { consecutive: this.invalidDecisionStreak, code: 'PROFILE_WORK_NOT_FOUND' } });
+        this.save({ lastProfileDecision: null, decisionRetry: { consecutive: this.invalidDecisionStreak, code: 'PROFILE_WORK_NOT_FOUND' } });
         if (this.invalidDecisionStreak >= 3) throw failure('连续三次未取得有效观看决策，已停止本次观看；今日用量保留。');
         return { current: await this.execute('douyin_open', {}, { allowLoading: true }) };
       }

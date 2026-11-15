@@ -252,6 +252,45 @@ test('回复模式只点击指定评论的回复入口，并在发布后确认�
   const result = await f.commenter.post({ expectedVideoId: '12345', text, replyToIndex: 2 }, { authorize: f.authorize });
   assert.equal(result.confirmed, true); assert.deepEqual(await f.page.evaluate(() => window.replyClicks), [2]);
 });
+test('回复序号只按顶层评论计数，楼中楼展开不影响目标', async t => {
+  const f = await fixture(t, { result: { id: '90003', mine: true, status: 'sent', videoId: '12345' }, existing: [
+    { id: '90001', mine: false, status: 'sent', text: '第一条评论' },
+    { id: '90002', mine: false, status: 'sent', text: '第二条评论' },
+  ] });
+  await f.page.evaluate(() => {
+    window.replyTargets = [];
+    const rows = [...document.querySelectorAll('[data-e2e="comment-item"]')];
+    const nested = document.createElement('div');
+    nested.setAttribute('data-e2e', 'comment-item');
+    nested.setAttribute('data-comment-id', '90004');
+    nested.setAttribute('data-video-id', '12345');
+    nested.setAttribute('data-is-self', 'false');
+    nested.setAttribute('data-send-status', 'sent');
+    nested.style.cssText = 'display:block;width:200px;height:30px';
+    const nestedBody = document.createElement('span');
+    nestedBody.setAttribute('data-e2e', 'comment-content');
+    nestedBody.textContent = '楼中楼回复';
+    nested.append(nestedBody);
+    rows[0].append(nested);
+    const tops = [...document.querySelectorAll('[data-e2e="comment-item"]')].filter(row => !row.parentElement?.closest('[data-e2e="comment-item"]'));
+    tops.forEach((row, index) => {
+      const reply = document.createElement('span');
+      reply.textContent = '回复';
+      reply.style.cssText = 'display:inline-block;cursor:pointer;width:40px;height:20px';
+      reply.addEventListener('click', () => {
+        window.replyTargets.push({ index: index + 1, text: row.querySelector('[data-e2e="comment-content"]')?.textContent || '' });
+        const editor = document.querySelector('[contenteditable]');
+        editor.setAttribute('aria-label', `回复 @合成用户${index + 1}`);
+        editor.focus();
+      });
+      row.append(reply);
+    });
+  });
+  const result = await f.commenter.post({ expectedVideoId: '12345', text, replyToIndex: 2 }, { authorize: f.authorize });
+  assert.equal(result.confirmed, true);
+  // 楼中楼占了一行，但序号仍指向第二条顶层评论。
+  assert.deepEqual(await f.page.evaluate(() => window.replyTargets), [{ index: 2, text: '第二条评论' }]);
+});
 test('没有回复序号时，输入框处于回复状态仍拒绝改发新评论', async t => {
   const f = await fixture(t, { existing: [{ id: '90001', mine: false, status: 'sent', text: '原评论' }] });
   await f.page.evaluate(() => document.querySelector('[contenteditable]').setAttribute('aria-label', '回复 @合成用户'));

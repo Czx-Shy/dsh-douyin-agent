@@ -13,6 +13,8 @@ const write = (file, value) => { const temporary = `${file}.${process.pid}.${ran
 
 function validatePolicy(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw fail('查看主页设置必须是对象。');
+  if (value.enabled !== undefined && typeof value.enabled !== 'boolean') throw fail('查看主页开关必须是布尔值。');
+  if (value.dailyLimit !== undefined && !(Number.isSafeInteger(value.dailyLimit) && value.dailyLimit >= 1 && value.dailyLimit <= 50)) throw fail('每日查看主页次数须为 1 至 50 的整数。');
   const enabled = typeof value.enabled === 'boolean' ? value.enabled : DEFAULTS.enabled;
   const dailyLimit = Number.isSafeInteger(value.dailyLimit) && value.dailyLimit >= 1 && value.dailyLimit <= 50 ? value.dailyLimit : DEFAULTS.dailyLimit;
   if (value.prompt !== undefined && typeof value.prompt !== 'string') throw fail('查看主页提示词必须是文字。');

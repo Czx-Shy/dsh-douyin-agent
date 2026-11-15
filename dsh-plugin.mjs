@@ -13,7 +13,7 @@ import { randomUUID } from 'node:crypto';
 import { ScheduledWatch } from './scheduled-watch.mjs';
 import { FriendInteractions } from './friend-interactions.mjs';
 import { UsageLedger } from './usage-ledger.mjs';
-import { DiagnosticsService } from './diagnostics.mjs?v=18';
+import { DiagnosticsService } from './diagnostics.mjs?v=19';
 import { WatchOptions } from './watch-options.mjs';
 
 export const name = 'douyin-browser';
@@ -103,7 +103,7 @@ function nativeParameters(schema) {
   };
 }
 
-export function createNativeToolDefinitions({ ctx, getController, getWatch, getSpark, getDiagnostics, attachPersona }) {
+export function createNativeToolDefinitions({ ctx, getController, getWatch, getSpark, getDiagnostics, attachPersona, startChat }) {
   return TOOL_DEFINITIONS.map((definition) => ({
     ...definition,
     parameters: nativeParameters(definition.parameters),
@@ -128,6 +128,9 @@ export function createNativeToolDefinitions({ ctx, getController, getWatch, getS
         if(definition.name==='douyin_watch_start') result=await watch.start({startSession:false,maxRequests:args.maxRequests??30},{explicit:true});
         else if(definition.name==='douyin_watch_stop') result=await watch.stop({explicit:true});
         else result=watch.state();
+      } else if (startChat && definition.name === 'douyin_chat_start') {
+        // 第一条私信回复必须走宿主模型；缺少模型选择时给出明确提示，不走空 Key 的 API 分支。
+        result = await startChat(exec);
       } else result = await controller.execute(definition.name, args, { signal: exec.signal });
       if (!result || typeof result !== 'object' || Array.isArray(result)) throw new Error('浏览器控制器未返回 JSON 对象。');
       if (result.ok === false && !definition.name.startsWith('douyin_diagnostics')) throw new Error(typeof result.error === 'string' ? result.error : result.error?.message ?? '抖音工具执行失败。');
@@ -180,19 +183,19 @@ export async function apply(ctx, config = {}) {
   const getController = () => {
     if (disposed) throw new Error('抖音插件已卸载。');
     // 调度器复用延迟创建的控制器；只有实际观看或已许可回复需要浏览器。
-    controllerPromise ??= import('./core.mjs?v=18')
+    controllerPromise ??= import('./core.mjs?v=19')
       .then(({ BrowserController }) => new BrowserController({ ...config, source: 'dsh', personaMemory: sharedPersona }))
       .catch((error) => { controllerPromise = undefined; throw error; });
     return controllerPromise;
   };
-  const {PersonaMemory}=await import('./persona-memory.mjs?v=10');
+  const {PersonaMemory}=await import('./persona-memory.mjs?v=11');
   const sharedPersona=new PersonaMemory();
   const personaBinding=bindNativePersonaContext(ctx,{workspacePaths:[path.dirname(resolveRuntimePaths().memoryDir),path.dirname(fileURLToPath(import.meta.url))],getPersonaMemory:()=>{
     // 提示词读取不触发浏览器或模型，按每次生成时的文件内容刷新。
     return sharedPersona;
   }});
   const getWatch=async(exec,starting)=>{
-    if (!watchPromise) watchPromise=Promise.all([getController(),import('./autonomous-watch.mjs?v=20')]).then(async ([controller,{AutonomousWatch}])=>{
+    if (!watchPromise) watchPromise=Promise.all([getController(),import('./autonomous-watch.mjs?v=21')]).then(async ([controller,{AutonomousWatch}])=>{
       if(starting) sharedPersona.initialize({importLegacy:false});
       const route=exec.agent?.session?.requestHeader?.()?.config ?? exec.agent?.options ?? {};
       return new AutonomousWatch({controller,videoLimits:controller.limits(),personaMemory:sharedPersona,commentService:await controller.getComments(),reportService:await controller.getReport(),source:'dsh',config:{apiKey:'',baseUrl:'https://api.deepseek.com',model:route.model||'deepseek-flash'},...(starting?{decisionProvider:createNativeWatchDecision({llm:optionalService(ctx,'llm'),attachments:optionalService(ctx,'attachments'),agent:exec.agent})}:{})});
@@ -230,7 +233,14 @@ export async function apply(ctx, config = {}) {
       interactionStates: async () => ({ chat: (await controller.getChatService()).state(), spark: (await controller.getSparkService()).state(), comments: (await controller.getComments()).state() }),
     });
   };
-  const definitions = createNativeToolDefinitions({ ctx, getController, getWatch, getSpark, getDiagnostics, attachPersona:personaBinding.attach });
+  const definitions = createNativeToolDefinitions({ ctx, getController, getWatch, getSpark, getDiagnostics, attachPersona: personaBinding.attach, startChat: async exec => {
+    const chat = await (await getController()).getChatService();
+    const route = modelSettings.state();
+    if (route.configured !== true) throw Object.assign(new Error('请先在刷抖音设置页选择 DSH 提供商和模型，再启动私信自动回复。'), { status: 400 });
+    chat.agent.config.model = route.model;
+    chat.setReplyProvider(createNativeWatchDecision({ llm: optionalService(ctx, 'llm'), attachments: optionalService(ctx, 'attachments'), agent: settingsExec(true).agent, maxTokens: 512, purpose: 'chat' }));
+    return chat.start({ signal: exec.signal });
+  } });
   const disposers = [];
   const launchLifetime = new AbortController();
   let commandFiber, settingsFiber, cleanupPromise;

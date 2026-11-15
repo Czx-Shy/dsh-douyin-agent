@@ -4,7 +4,7 @@ import { randomBytes, timingSafeEqual } from 'node:crypto';
 
 import { UsageLedger } from './usage-ledger.mjs';
 import { WatchOptions } from './watch-options.mjs';
-import { DiagnosticsService } from './diagnostics.mjs?v=18';
+import { DiagnosticsService } from './diagnostics.mjs?v=19';
 import { resolveRuntimePaths } from './runtime-paths.mjs';
 
 const PREFIX = '/api/douyin-browser';

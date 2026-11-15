@@ -20,6 +20,8 @@ const policy = (windows = ['00:00-24:00'], sessionMinutes = 10) => ({ windows, s
 test('默认 10 分钟且未开始时拒绝刷；状态、暂停和私信不受限，模型调用不能重置时钟', (t) => {
   const f = fixture(t); assert.equal(f.limits.state().policy.dailyMinutes, 10); assert.equal(f.limits.beforeAction('api', 'douyin_open').allowed, false);
   assert.equal(f.limits.beforeAction('dsh', 'douyin_status').allowed, true); assert.equal(f.limits.beforeAction('api', 'douyin_pause').allowed, true); assert.equal(f.limits.beforeAction('dsh', 'douyin_chat_status').allowed, true);
+  // 读评论是只读动作，不受“允许观看”时段限制。
+  assert.equal(f.limits.beforeAction('dsh', 'douyin_read_comments').allowed, true); assert.equal(f.limits.beforeAction('api', 'douyin_read_comments').allowed, true);
   assert.throws(() => f.limits.markSession('api'), /明确/); assert.throws(() => f.limits.savePolicy(policy()), /明确/);
 });
 test('API、DSH 和重建实例共用同一时钟，open/next 不会给一轮自动加时', (t) => {
