@@ -12,15 +12,16 @@ import { PersonaMemory } from '../persona-memory.mjs';
 import { VideoLimits } from '../video-limits.mjs';
 import { DailyReport } from '../daily-report.mjs';
 import { WatchMode } from '../watch-mode.mjs';
+import { dshNodeModules as sdk, nativeTest } from './sdk.mjs';
 
-const sdk = process.env.DSH_NODE_MODULES || 'F:/codex/DSH Desktop 2/resources/app/node_modules';
-const [{ Context }, { WebServer }, { LlmRuntime }, { default: Loader }, { ClientModuleRegistry }] = await Promise.all([
+const sdkModules = sdk ? await Promise.all([
   import(pathToFileURL(path.join(sdk, '@deepseek-ai/cordis/lib/index.js')).href),
   import(pathToFileURL(path.join(sdk, '@deepseek-ai/dsh-host-webserver/lib/index.js')).href),
   import(pathToFileURL(path.join(sdk, '@deepseek-ai/dsh-llm/lib/index.js')).href),
   import(pathToFileURL(path.join(sdk, '@deepseek-ai/cordis-plugin-loader/lib/index.js')).href),
   import(pathToFileURL(path.join(sdk, '@deepseek-ai/dsh-client-modules/lib/index.js')).href),
-]);
+]) : [];
+const [{ Context } = {}, { WebServer } = {}, { LlmRuntime } = {}, { default: Loader } = {}, { ClientModuleRegistry } = {}] = sdkModules;
 
 async function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-native-settings-sdk-'));
@@ -67,7 +68,7 @@ async function fixture(t) {
   return { root, ctx, llmFiber, llm, metadata, catalogQueries, modelSettings, memory, limits, report, mode, flags, events, base, bootstrap, request, unregister, controllers: () => controllers, holdMetadata: hook => { waitForMetadata = hook; } };
 }
 
-test('真实 WebServer 承载原生设置，读取共享人格和本机状态不调用模型或启动任务', async t => {
+nativeTest('真实 WebServer 承载原生设置，读取共享人格和本机状态不调用模型或启动任务', async t => {
   const f = await fixture(t), data = await f.bootstrap();
   assert.equal(data.persona.roleCardFile, f.memory.roleCardFile); assert.equal(data.persona.manualText, f.memory.snapshot().manualText);
   assert.equal(data.setup.independentAppRequired, false); assert.equal(data.setup.audioOptional, true);
@@ -80,7 +81,7 @@ test('真实 WebServer 承载原生设置，读取共享人格和本机状态不
   assert.equal(/apiKey|authorization|messages|sessionId/.test(JSON.stringify(data)), false);
 });
 
-test('真实 Cordis 追踪代理重复读取仍共用模型目录缓存并保留服务更换检查', async t => {
+nativeTest('真实 Cordis 追踪代理重复读取仍共用模型目录缓存并保留服务更换检查', async t => {
   const f = await fixture(t);
   assert.notEqual(f.ctx.get('llm'), f.ctx.get('llm'));
   assert.equal(f.ctx.get('llm')[Symbol.for('cordis.original')], f.ctx.get('llm')[Symbol.for('cordis.original')]);
@@ -95,7 +96,7 @@ test('真实 Cordis 追踪代理重复读取仍共用模型目录缓存并保留
   await f.llmFiber.dispose(); assert.equal(f.modelSettings.state().configured, false);
 });
 
-test('真实 LlmRuntime 验证已配置模型，动态依赖晚挂载仍可用且不保存独立密钥', async t => {
+nativeTest('真实 LlmRuntime 验证已配置模型，动态依赖晚挂载仍可用且不保存独立密钥', async t => {
   const f = await fixture(t); let available;
   const settings = new NativeModelSettings({ stateDir: path.join(f.root, 'late-model'), getLlm: () => available });
   assert.deepEqual(settings.state().providers, []); available = f.llm;
@@ -109,7 +110,7 @@ test('真实 LlmRuntime 验证已配置模型，动态依赖晚挂载仍可用�
   available = undefined; assert.equal(settings.state().configured, false);
 });
 
-test('原生设置拒绝跨来源、伪造 Host 和缺少令牌的修改，校验发生在控制器操作前', async t => {
+nativeTest('原生设置拒绝跨来源、伪造 Host 和缺少令牌的修改，校验发生在控制器操作前', async t => {
   const f = await fixture(t); await f.bootstrap(); const count = f.controllers();
   assert.equal((await f.request('/mode/configure', { silent: true }, { origin: 'https://untrusted.invalid' })).status, 403);
   assert.equal((await f.request('/mode/configure', { silent: true }, { 'sec-fetch-site': 'same-site' })).status, 403);
@@ -120,7 +121,7 @@ test('原生设置拒绝跨来源、伪造 Host 和缺少令牌的修改，校�
   assert.equal((await f.request('/mode/configure', { silent: true }, { 'content-type': 'text/plain' })).status, 400);
 });
 
-test('原生设置只允许带令牌的待处理标记，GET 列表和 POST 处理均复用原生 WebServer', async t => {
+nativeTest('原生设置只允许带令牌的待处理标记，GET 列表和 POST 处理均复用原生 WebServer', async t => {
   const f = await fixture(t), boot = await f.bootstrap();
   assert.equal((await f.request('/chat/unanswered')).status, 403);
   const list = await f.request('/chat/unanswered', undefined, { 'x-douyin-settings-token': boot.token }); assert.equal(list.status, 200); assert.equal(list.body.count, 2);
@@ -134,7 +135,7 @@ test('原生设置只允许带令牌的待处理标记，GET 列表和 POST 处�
   assert.equal(prepared.status, 200); assert.equal(f.events.at(-1).kind, 'interactions/prepare');
 });
 
-test('原生人格保存写入真实共享人格卡并核对版本，拒绝未知字段和运行中修改', async t => {
+nativeTest('原生人格保存写入真实共享人格卡并核对版本，拒绝未知字段和运行中修改', async t => {
   const f = await fixture(t), first = await f.bootstrap();
   const saved = await f.request('/persona/configure', { content: '# 合成人格\n\n说话简短，依据实际观看判断兴趣。', expectedRevision: first.persona.revision });
   assert.equal(saved.status, 200); assert.match(f.memory.snapshot().manualText, /合成人格/);
@@ -147,7 +148,7 @@ test('原生人格保存写入真实共享人格卡并核对版本，拒绝未�
   assert.equal(f.memory.snapshot().revision, revision); assert.deepEqual(f.events, []);
 });
 
-test('设置页模型选择通过真实 SDK 元数据验证，运行中的私信或问候阻止改路由', async t => {
+nativeTest('设置页模型选择通过真实 SDK 元数据验证，运行中的私信或问候阻止改路由', async t => {
   const f = await fixture(t); await f.bootstrap();
   assert.equal((await f.request('/model/configure', { provider: 'missing', model: 'visual-model' })).status, 400);
   assert.equal(f.metadata.length, 0);
@@ -161,7 +162,7 @@ test('设置页模型选择通过真实 SDK 元数据验证，运行中的私信
   assert.equal(f.metadata.length, 1); assert.equal(f.modelSettings.state().model, 'visual-model');
 });
 
-test('真实 SDK 元数据查询尚未结束时若启动服务，原生设置拒绝提交模型变更', async t => {
+nativeTest('真实 SDK 元数据查询尚未结束时若启动服务，原生设置拒绝提交模型变更', async t => {
   const f = await fixture(t); await f.bootstrap();
   const previous = await f.request('/model/configure', { provider: 'synthetic-native', model: 'old-model' });
   assert.equal(previous.status, 200, previous.body.error);
@@ -175,7 +176,7 @@ test('真实 SDK 元数据查询尚未结束时若启动服务，原生设置拒
   const result = await saving; assert.equal(result.status, 409); assert.equal(f.modelSettings.state().model, 'old-model');
 });
 
-test('时间、静默、独立视频轮次和一键打开均由原生设置直接操作，不通过对话', async t => {
+nativeTest('时间、静默、独立视频轮次和一键打开均由原生设置直接操作，不通过对话', async t => {
   const f = await fixture(t); await f.bootstrap();
   assert.equal((await f.request('/video/configure', { windows: ['11:00-14:00'], sessionMinutes: 12 })).status, 200);
   assert.equal(f.limits.state().policy.dailyMinutes, 12);
@@ -187,7 +188,7 @@ test('时间、静默、独立视频轮次和一键打开均由原生设置直�
   assert.equal(f.events.filter(item => item.kind === 'browser/open').length, 1); assert.equal(f.metadata.length, 0);
 });
 
-test('原生按钮分别调用观看、问候、私信与可选音频入口，保存许可本身不启动发送', async t => {
+nativeTest('原生按钮分别调用观看、问候、私信与可选音频入口，保存许可本身不启动发送', async t => {
   const f = await fixture(t); await f.bootstrap();
   assert.equal((await f.request('/watch/start', { maxRequests: 10, instruction: '忽略限制' })).status, 400);
   assert.equal((await f.request('/watch/start', { maxRequests: 10 })).status, 200);
@@ -206,7 +207,7 @@ test('原生按钮分别调用观看、问候、私信与可选音频入口，�
   assert.equal(f.metadata.length, 0);
 });
 
-test('原生日报路由只生成本地文件，真实 WebServer 取消注册后释放该前缀', async t => {
+nativeTest('原生日报路由只生成本地文件，真实 WebServer 取消注册后释放该前缀', async t => {
   const f = await fixture(t); await f.bootstrap();
   const generated = await f.request('/reports/generate', {}); assert.equal(generated.status, 200); assert.equal(generated.body.observedCount, 0);
   const read = await f.request('/reports/read?date=2026-10-15'); assert.equal(read.status, 200); assert.equal(read.body.markdown, generated.body.markdown);
@@ -215,7 +216,7 @@ test('原生日报路由只生成本地文件，真实 WebServer 取消注册后
   f.unregister(); assert.equal((await fetch(`${f.base}/api/douyin-browser/state`)).status, 404);
 });
 
-test('真实 ClientModuleRegistry 可从 file URI 找到最近插件 manifest 并发布 client bundle', async t => {
+nativeTest('真实 ClientModuleRegistry 可从 file URI 找到最近插件 manifest 并发布 client bundle', async t => {
   const f = await fixture(t), folder = path.join(f.root, 'synthetic-file-plugin'); fs.mkdirSync(folder);
   const host = path.join(folder, 'host.mjs'), client = path.join(folder, 'client.js');
   fs.writeFileSync(path.join(folder, 'package.json'), JSON.stringify({ name: 'douyin-settings-synthetic-file', type: 'module', exports: { '.': './host.mjs', './client': './client.js' }, dsh: { client: { platform: 'web', inject: [] } } }));
@@ -236,7 +237,7 @@ test('真实 ClientModuleRegistry 可从 file URI 找到最近插件 manifest �
   assert.equal((await fetch(`${f.base}/plugins/unknown.js`)).status, 404);
 });
 
-test('当前产品 manifest 与 client 在真实 SDK 图中可发现并先加载原生设置提供者', async t => {
+nativeTest('当前产品 manifest 与 client 在真实 SDK 图中可发现并先加载原生设置提供者', async t => {
   const f = await fixture(t);
   const loader = f.ctx.plugin(Loader, { baseUrl: pathToFileURL(path.join(f.root, 'cordis.yml')).href }); await loader.await(); f.ctx.loader.internal = undefined;
   const productUri = new URL('../dsh-plugin.mjs?v=10', import.meta.url).href;

@@ -15,8 +15,9 @@ function fixture(t, options = {}) {
   const videoLimits = new VideoLimits({ stateDir, now: clock }); videoLimits.savePolicy({ windows: ['00:00-24:00'], sessionMinutes: 60 }, { explicit: true }); videoLimits.markSession('api', { explicit: true });
   const calls = [], watchRunId = 'synthetic-watch';
   const lock = () => fs.writeFileSync(path.join(stateDir, 'watch-loop.lock'), JSON.stringify({ version: 1, pid: process.pid, runId: watchRunId, sessionId: videoLimits.state().session.id, source: 'api', status: 'running' })); lock();
-  const post = options.post || (async (input, controls) => { calls.push({ input, controls }); controls.authorize({ phase: 'prepare', videoId: input.expectedVideoId }); controls.authorize({ phase: 'before-click', videoId: input.expectedVideoId }); const release = controls.authorize.beginDispatch(); release(); return receipt(input.expectedVideoId); });
-  const service = new AutonomousComments({ personaMemory, videoLimits, post, stateDir, now: clock });
+  const { post: postOption, ...rest } = options;
+  const post = postOption || (async (input, controls) => { calls.push({ input, controls }); controls.authorize({ phase: 'prepare', videoId: input.expectedVideoId }); controls.authorize({ phase: 'before-click', videoId: input.expectedVideoId }); const release = controls.authorize.beginDispatch(); release(); return receipt(input.expectedVideoId); });
+  const service = new AutonomousComments({ personaMemory, videoLimits, post, stateDir, now: clock, ...rest });
   const evidence = (id = '12345', text = '这个配色挺有意思，画面很舒服。') => ({ evidenceId: personaMemory.recordObservation(videoState(id), { source: 'api' }).evidenceId, videoId: id, text });
   t.after(async () => { await service.close(); assert.equal(path.dirname(root), os.tmpdir()); fs.rmSync(root, { recursive: true, force: true }); });
   return { root, stateDir, clock, setNow: value => { now = value; }, service, personaMemory, videoLimits, evidence, calls, watchRunId, controls: { watchRunId }, lock };
@@ -55,6 +56,16 @@ test('确认回执精确绑定作品和commentId，预留扣每日与单轮次�
   assert.equal(f.service.state().daily.attempts, 1); assert.equal(f.service.state().session.remaining, 0); assert.equal(f.service.context().enabled, false); assert.equal(f.service.ledger().operations[0].status, 'confirmed');
   await assert.rejects(f.service.comment(f.evidence('67890'), f.controls), /次数/); assert.equal(fs.existsSync(f.service.files.send), false);
 });
+test('回复评论必须带稳定目标，并原样传给发布器', async t => {
+  const f = fixture(t); f.service.configure({ enabled: true }, { explicit: true });
+  const input = f.evidence();
+  for (const replyToIndex of [0, 21, 1.5, '2']) await assert.rejects(f.service.comment({ ...input, replyToIndex, replyToCommentId: '90002', replyToText: '目标评论' }, f.controls), /只接受/);
+  await assert.rejects(f.service.comment({ ...input, replyToIndex: 2 }, f.controls), /完整回复目标/);
+  assert.equal(f.calls.length, 0);
+  const result = await f.service.comment({ ...input, replyToIndex: 2, replyToCommentId: '90002', replyToText: '目标评论' }, f.controls);
+  assert.equal(result.confirmed, true); assert.equal(f.calls[0].input.replyToIndex, 2); assert.equal(f.calls[0].input.replyToCommentId, '90002');
+  assert.equal(f.service.ledger().operations[0].replyToCommentId, '90002');
+});
 test('停启同一轮不重置次数，新轮只重置单轮额度，跨日也不重复旧作品', async t => {
   const f = fixture(t); f.service.configure({ enabled: true, dailyLimit: 3, perSessionLimit: 1 }, { explicit: true }); const first = f.evidence(); await f.service.comment(first, f.controls);
   f.lock(); await assert.rejects(f.service.comment(f.evidence('67890'), f.controls), /次数/);
@@ -62,21 +73,80 @@ test('停启同一轮不重置次数，新轮只重置单轮额度，跨日也�
   await f.service.comment(f.evidence('67890'), f.controls); assert.equal(f.service.state().daily.attempts, 2);
   f.setNow(Date.parse('2026-10-15T16:01:00Z')); f.videoLimits.endSession({explicit:true}); f.videoLimits.markSession('api', { explicit: true }); f.lock(); assert.equal(f.service.state().daily.remaining, 3); await assert.rejects(f.service.comment(first, f.controls), /重复/); assert.equal(f.calls.length, 2);
 });
-test('输入不可用和发布前失败不退次数，也不自动重试同作品', async t => {
+test('输入不可用和发布前失败释放额度，并允许同作品重新尝试', async t => {
   const f = fixture(t, { post: async () => ({ confirmed: false, deliveryUncertain: false, needsUserAction: true, reason: '合成未打开评论面板' }) }); f.service.configure({ enabled: true, perSessionLimit: 3 }, { explicit: true }); const input = f.evidence(), result = await f.service.comment(input, f.controls);
-  assert.equal(result.needsUserAction, true); assert.equal(result.deliveryUncertain, false); assert.equal(f.service.ledger().operations[0].status, 'not-sent'); assert.equal(f.service.state().daily.attempts, 1);
-  f.service.configure({ enabled: false }, { explicit: true }); f.service.configure({ enabled: true }, { explicit: true }); await assert.rejects(f.service.comment(input, f.controls), /重复/);
+  assert.equal(result.needsUserAction, true); assert.equal(result.deliveryUncertain, false); assert.equal(f.service.ledger().operations[0].status, 'not-sent'); assert.equal(f.service.state().daily.attempts, 0);
+  f.service.configure({ enabled: false }, { explicit: true }); f.service.configure({ enabled: true }, { explicit: true });
+  const retry = await f.service.comment(input, f.controls); assert.equal(retry.confirmed, false); assert.equal(f.service.ledger().operations.length, 2);
 });
 test('确认缺commentId、错作品或没有可信发布授权时均不能当成功', async t => {
   for (const result of [{ ...receipt('12345'), commentId: '' }, receipt('67890'), receipt('12345')]) {
-    const f = fixture(t, { post: async (input, controls) => { if (!result.commentId || result.videoId !== '12345') controls.authorize({ phase: 'before-click', videoId: input.expectedVideoId }); return result; } }); f.service.configure({ enabled: true }, { explicit: true }); const output = await f.service.comment(f.evidence(), f.controls); assert.equal(output.confirmed, false); assert.equal(output.deliveryUncertain, true); assert.equal(f.service.state().paused, true);
+    const f = fixture(t, { post: async (input, controls) => { if (!result.commentId || result.videoId !== '12345') controls.authorize({ phase: 'before-click', videoId: input.expectedVideoId }); return result; } }); f.service.configure({ enabled: true }, { explicit: true }); const output = await f.service.comment(f.evidence(), f.controls); assert.equal(output.confirmed, false); assert.equal(output.deliveryUncertain, true); assert.equal(f.service.state().paused, false); assert.equal(f.service.state().pendingRecheck, 1);
   }
 });
 test('未确认跨重启暂停，人工核对只解除暂停，不退次数或重发旧作品', async t => {
   const f = fixture(t, { post: async (input, controls) => { controls.authorize({ phase: 'before-click', videoId: input.expectedVideoId }); return { confirmed: false, deliveryUncertain: true }; } }); f.service.configure({ enabled: true, perSessionLimit: 3 }, { explicit: true }); const input = f.evidence(), result = await f.service.comment(input, f.controls);
-  const restarted = new AutonomousComments({ personaMemory: f.personaMemory, videoLimits: f.videoLimits, stateDir: f.stateDir, now: f.clock }); assert.equal(restarted.state().paused, true);
-  restarted.configure({ enabled: false }, { explicit: true }); assert.throws(() => restarted.configure({ enabled: true }, { explicit: true }), /核对/); assert.throws(() => restarted.resolve({ operationId: result.operationId, outcome: 'not-sent' }), /用户/);
-  restarted.resolve({ operationId: result.operationId, outcome: 'not-sent' }, { explicit: true }); restarted.configure({ enabled: true }, { explicit: true }); assert.equal(restarted.state().daily.attempts, 1); await assert.rejects(restarted.comment(input, f.controls), /重复/); await restarted.close();
+  const restarted = new AutonomousComments({ personaMemory: f.personaMemory, videoLimits: f.videoLimits, stateDir: f.stateDir, now: f.clock }); assert.equal(restarted.state().paused, false); assert.equal(restarted.state().pendingRecheck, 1);
+  restarted.configure({ enabled: false }, { explicit: true }); assert.throws(() => restarted.configure({ enabled: true }, { explicit: true }), /核对/); await assert.rejects(restarted.resolve({ operationId: result.operationId, outcome: 'not-sent' }), /用户/);
+  await restarted.resolve({ operationId: result.operationId, outcome: 'not-sent' }, { explicit: true }); restarted.configure({ enabled: true }, { explicit: true }); assert.equal(restarted.state().daily.attempts, 0); await restarted.close();
+});
+test('未确认进入延迟复核，复核期间不暂停且只阻止同作品', async t => {
+  const verified = [];
+  const f = fixture(t, {
+    post: async (input, controls) => { controls.authorize({ phase: 'before-click', videoId: input.expectedVideoId }); return { confirmed: false, deliveryUncertain: true, baselineKnownIds: ['89999'] }; },
+    getCommenter: async () => ({ verifyPublished: async input => { verified.push(input); return { found: true, commentId: '90003' }; } }),
+  });
+  f.service.configure({ enabled: true, dailyLimit: 3, perSessionLimit: 3 }, { explicit: true });
+  const input = f.evidence(), result = await f.service.comment(input, f.controls);
+  assert.equal(result.deliveryUncertain, true); assert.equal(result.pendingRecheck, true);
+  assert.equal(f.service.state().paused, false); assert.equal(f.service.state().pendingRecheck, 1);
+  assert.equal(Date.parse(f.service.ledger().operations[0].recheckDueAt) - Date.parse(f.service.ledger().operations[0].completedAt), 45000);
+  assert.deepEqual(f.service.state().pendingRecheckVideos, ['12345']); assert.equal(f.service.context().enabled, true);
+  await assert.rejects(f.service.comment(input, f.controls), /重复/);
+  f.setNow(Date.parse(f.service.state().nextRecheckAt) + 1);
+  assert.deepEqual(await f.service.recheckDue(), { checked: 1, confirmed: 1, pending: 0, exhausted: 0 });
+  assert.equal(verified[0].expectedVideoId, '12345'); assert.deepEqual(verified[0].knownIds, ['89999']);
+  assert.equal(f.service.ledger().operations[0].status, 'confirmed'); assert.equal(f.service.state().pendingRecheck, 0); assert.equal(f.service.state().paused, false);
+});
+test('复核连续未命中三次后转为最终未确认并暂停', async t => {
+  const f = fixture(t, {
+    post: async (input, controls) => { controls.authorize({ phase: 'before-click', videoId: input.expectedVideoId }); return { confirmed: false, deliveryUncertain: true }; },
+    getCommenter: async () => ({ verifyPublished: async () => ({ found: false }) }),
+  });
+  f.service.configure({ enabled: true }, { explicit: true }); await f.service.comment(f.evidence(), f.controls);
+  for (let attempt = 0; attempt < 3; attempt++) { f.setNow(Date.parse(f.service.state().nextRecheckAt || f.service.state().needsReview[0].recheckDueAt) + 1); await f.service.recheckDue(); }
+  assert.equal(f.service.state().pendingRecheck, 0); assert.equal(f.service.state().paused, true);
+  assert.equal(f.service.state().needsReview[0].pendingRecheck, false); assert.equal(f.service.state().needsReview[0].recheckAttempts, 3);
+});
+test('复核遇到页面不在目标作品时只顺延不消耗次数', async t => {
+  const f = fixture(t, {
+    post: async (input, controls) => { controls.authorize({ phase: 'before-click', videoId: input.expectedVideoId }); return { confirmed: false, deliveryUncertain: true }; },
+    getCommenter: async () => ({ verifyPublished: async () => ({ found: false, unavailable: true, reason: '页面不在目标作品' }) }),
+  });
+  f.service.configure({ enabled: true }, { explicit: true }); await f.service.comment(f.evidence(), f.controls);
+  f.setNow(Date.parse(f.service.state().nextRecheckAt) + 1);
+  assert.deepEqual(await f.service.recheckDue(), { checked: 1, confirmed: 0, pending: 1, exhausted: 0 });
+  assert.equal(f.service.state().needsReview[0].recheckAttempts, 0); assert.equal(f.service.state().paused, false);
+});
+test('核对未发送会同步评论收据并释放额度', async t => {
+  const calls = [];
+  const f = fixture(t, {
+    post: async (input, controls) => { controls.authorize({ phase: 'before-click', videoId: input.expectedVideoId }); return { confirmed: false, deliveryUncertain: true, operationId: 'browser-op-1' }; },
+    getCommenter: async () => ({ markResolved: input => { calls.push(input); } }),
+  });
+  f.service.configure({ enabled: true }, { explicit: true }); const result = await f.service.comment(f.evidence(), f.controls);
+  await f.service.resolve({ operationId: result.operationId, outcome: 'not-sent' }, { explicit: true });
+  assert.deepEqual(calls, [{ videoId: '12345', operationId: 'browser-op-1', outcome: 'not-sent' }]);
+  assert.equal(f.service.state().daily.attempts, 0); assert.equal(f.service.state().paused, false);
+});
+test('收据同步失败时拒绝核对且不释放额度', async t => {
+  const f = fixture(t, {
+    post: async (input, controls) => { controls.authorize({ phase: 'before-click', videoId: input.expectedVideoId }); return { confirmed: false, deliveryUncertain: true, operationId: 'browser-op-2' }; },
+    getCommenter: async () => ({ markResolved: () => { throw new Error('评论收据已确认发布，不能改为未发送。'); } }),
+  });
+  f.service.configure({ enabled: true }, { explicit: true }); const result = await f.service.comment(f.evidence(), f.controls);
+  await assert.rejects(f.service.resolve({ operationId: result.operationId, outcome: 'not-sent' }, { explicit: true }), /不能改为未发送/);
+  assert.equal(f.service.state().daily.attempts, 1); assert.equal(f.service.state().pendingRecheck, 1);
 });
 test('另一入口关闭、结束轮次、丢失观察或更换run都在最终发布前撤回', async t => {
   for (const mutation of ['disabled', 'session', 'evidence', 'run']) {
@@ -87,7 +157,7 @@ test('另一入口关闭、结束轮次、丢失观察或更换run都在最终�
       if (mutation === 'evidence') f.personaMemory.snapshot = () => ({ recentObservations: [] });
       if (mutation === 'run') fs.writeFileSync(path.join(f.stateDir, 'watch-loop.lock'), JSON.stringify({ pid: process.pid, source: 'api', runId: 'different', sessionId: f.videoLimits.state().session.id, status: 'running' }));
       controls.authorize({ phase: 'before-click', videoId: input.expectedVideoId }); assert.fail('撤回后不得发布');
-    } }); f.service.configure({ enabled: true }, { explicit: true }); await assert.rejects(f.service.comment(f.evidence(), f.controls)); assert.equal(f.service.ledger().operations[0].status, 'not-sent'); assert.equal(f.service.state().daily.attempts, 1);
+    } }); f.service.configure({ enabled: true }, { explicit: true }); await assert.rejects(f.service.comment(f.evidence(), f.controls)); assert.equal(f.service.ledger().operations[0].status, 'not-sent'); assert.equal(f.service.state().daily.attempts, 0);
   }
 });
 test('最终短输入与许可关闭互斥，释放后关闭才生效', async t => {
@@ -104,5 +174,5 @@ test('损坏记录和不明发送残锁不被自动清除或覆盖', async t => 
 });
 test('关闭只取消自己的发布，保持预留次数且不盲重发', async t => {
   const started = Promise.withResolvers(); const f = fixture(t, { post: async (input, controls) => { controls.authorize({ phase: 'prepare', videoId: input.expectedVideoId }); started.resolve(); await new Promise((resolve, reject) => controls.signal.addEventListener('abort', () => reject(controls.signal.reason), { once: true })); } }); f.service.configure({ enabled: true }, { explicit: true });
-  const other = new AutonomousComments({ personaMemory: f.personaMemory, videoLimits: f.videoLimits, stateDir: f.stateDir, now: f.clock }); const pending = f.service.comment(f.evidence(), f.controls).catch(error => error); await started.promise; await other.close(); assert.equal(f.service.state().busy, true); await f.service.close(); assert.ok(await pending instanceof Error); assert.equal(f.service.state().daily.attempts, 1); assert.equal(f.service.ledger().operations[0].status, 'not-sent');
+  const other = new AutonomousComments({ personaMemory: f.personaMemory, videoLimits: f.videoLimits, stateDir: f.stateDir, now: f.clock }); const pending = f.service.comment(f.evidence(), f.controls).catch(error => error); await started.promise; await other.close(); assert.equal(f.service.state().busy, true); await f.service.close(); assert.ok(await pending instanceof Error); assert.equal(f.service.state().daily.attempts, 0); assert.equal(f.service.ledger().operations[0].status, 'not-sent');
 });

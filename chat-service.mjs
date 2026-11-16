@@ -656,7 +656,9 @@ export class ChatService {
       return { ...this.state(), stopping: true, message: '已向当前回复进程发送停止请求。' };
     }
     if(!this.runId&&!preservePending)this.acquire();
-    this.stopContext={preservePending:preservePending===true,reason};if(this.runId){for(const mark of Object.values(this.watermarks.contacts)){delete mark.retry;if(!preservePending){if(mark.pending)mark.pending.restartAllowed=false;if(mark.recoveryQueue)mark.recoveryQueue.restartAllowed=false;}else if(mark.pending?.recoveryEvidence?.beforeDispatch===true&&['model','observing','superseded','outbound-wait','stopped-before-send'].includes(mark.pending.phase))allowMaintenanceRecovery(mark.pending);}this.persist();}this.running = false; this.stopPolling(); this.groupVideos?.interrupt();this.abort?.abort(new Error('用户停止私信自动回复。')); this.policy.enabled = false; this.log('service.stopped',{preservePending:preservePending===true,reason}); this.release(); return this.state();
+    // 空闲时点击“停止”不应再产生一条停止记录；只在确实有运行中的回复时记录。
+    const wasActive = Boolean(this.running || this.starting || this.busy || this.runId || worker?.alive);
+    this.stopContext={preservePending:preservePending===true,reason};if(this.runId){for(const mark of Object.values(this.watermarks.contacts)){delete mark.retry;if(!preservePending){if(mark.pending)mark.pending.restartAllowed=false;if(mark.recoveryQueue)mark.recoveryQueue.restartAllowed=false;}else if(mark.pending?.recoveryEvidence?.beforeDispatch===true&&['model','observing','superseded','outbound-wait','stopped-before-send'].includes(mark.pending.phase))allowMaintenanceRecovery(mark.pending);}this.persist();}this.running = false; this.stopPolling(); this.groupVideos?.interrupt();this.abort?.abort(new Error('用户停止私信自动回复。')); this.policy.enabled = false; if(wasActive)this.log('service.stopped',{preservePending:preservePending===true,reason}); this.release(); return this.state();
   }
   resumeContact(id) {
     if (this.running || this.starting || this.busy || this.worker()?.alive) throw new Error('请先停止自动回复，再人工解除联系人暂停。');

@@ -126,7 +126,16 @@ function cardParts(raw) {
 function escape(value) { return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;'); }
 function generated(state) {
   const interests = projectedInterests(state).sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 20);
-  const recent = state.observations.slice(-5);
+  // 同一作品多次观察只保留最新一条，避免人格卡生成区重复堆叠同一作品。
+  const recent = [];
+  const seenVideos = new Set();
+  for (const item of [...state.observations].reverse()) {
+    if (!item || seenVideos.has(item.videoId)) continue;
+    seenVideos.add(item.videoId);
+    recent.push(item);
+    if (recent.length === 5) break;
+  }
+  recent.reverse();
   const lines = [GENERATED_START, '\n## 自动整理的代理兴趣\n', `数据版本：${state.generation}。这里只记录小鲸自己的选题倾向，不表示用户喜欢这些内容。`];
   for (const item of interests) lines.push(`- ${escape(item.topic)}：${{ like: '感兴趣', dislike: '暂不感兴趣', neutral: '待观察' }[item.signal]}；${item.basis}`);
   if (!interests.length) lines.push('尚无基于抖音作品观察的兴趣记录。');

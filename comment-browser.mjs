@@ -6,9 +6,23 @@ import { BrowserController, readPageState } from './core.mjs?v=9';
 import { VideoLimits } from './video-limits.mjs';
 import { resolveRuntimePaths } from './runtime-paths.mjs';
 import { validateCommentText } from './autonomous-comments.mjs';
+import { COMMENT_LIST_LIMIT, COMMENT_TEXT_LIMIT, validCommentId } from './comment-contract.mjs';
 
 const stop = signal => signal?.throwIfAborted();
 const cleanDraft = value => String(value ?? '').replace(/[\u200B-\u200F\uFEFF]/g, '').trim();
+// 抖音回复输入框可能只把“回复@昵称”放在占位符或草稿前缀里；回复态允许这段平台生成的提及。
+const mentionPrefix = /^@[^\n\r@]{1,80}\s*$/;
+const draftEquals = (value, expected, allowMention = false) => {
+  const current = cleanDraft(value), target = cleanDraft(expected);
+  if (current === target) return true;
+  if (!allowMention) return false;
+  if (!target) return mentionPrefix.test(current);
+  return current.endsWith(target) && mentionPrefix.test(current.slice(0, current.length - target.length));
+};
+const draftCleared = (value, allowMention = false) => {
+  const current = cleanDraft(value);
+  return !current || Boolean(allowMention) && mentionPrefix.test(current);
+};
 const EDITORS = ['.comment-input-container [contenteditable="true"]', '.comment-input-container textarea', '.comment-input-inner-container [contenteditable="true"]', '.comment-input-inner-container textarea', '[data-e2e="comment-input"] [contenteditable="true"]', 'textarea[data-e2e="comment-input"]', '[contenteditable="true"][data-e2e="comment-input"]'].map(selector => `${selector}:not([data-e2e="im-dialog"] *):not([data-e2e="danmaku-container"] *)`).join(',');
 const BUTTONS = '[data-e2e="comment-post"],[data-e2e="comment-submit"],[data-e2e="comment-publish"],button,[role="button"],a,div,span';
 const LABELLED_BUTTONS = '[aria-label="发布"],[aria-label="发送"],[aria-label="发表评论"],[aria-label="发布评论"],[title="发布"],[title="发表评论"],[title="发布评论"]';
@@ -39,7 +53,7 @@ async function waitCommentState(test, check, signal, timeoutMs) {
   do { stop(signal); await check(); if (await test()) return true; if (Date.now() >= deadline) break; await waitForCommentTick(75, undefined, { signal }); } while (Date.now() < deadline);
   return false;
 }
-async function prepareCommentPointer(page, locator, { check, signal, expectedVideoId, mode, expectedDraft, nativeIcon = false, scope: scopeLocator = locator }) {
+async function prepareCommentPointer(page, locator, { check, signal, expectedVideoId, mode, expectedDraft, nativeIcon = false, reply = false, allowMention = false, scope: scopeLocator = locator }) {
   stop(signal); await check();
   if (await locator.count() !== 1) throw new Error('评论输入目标不唯一，未输入。');
   const currentSelf = await page.evaluate(readCommentSelfIdentity);
@@ -115,6 +129,15 @@ async function prepareCommentPointer(page, locator, { check, signal, expectedVid
       if (input.mode === 'editor') draftElement = element;
       if (input.mode === 'submit') { const editors = editorsInScope(); if (editors.length === 1) draftElement = editors[0]; else { element.removeAttribute('data-deepseek-comment-pointer'); return false; } }
       const clean = value => String(value ?? '').replace(/[\u200B-\u200F\uFEFF]/g, '').trim();
+      const mention = /^@[^\n\r@]{1,80}\s*$/;
+      const draftMatches = value => {
+        const current = clean(value), target = clean(input.expectedDraft);
+        if (current === target) return true;
+        if (!input.allowMention) return false;
+        if (!target) return mention.test(current);
+        return current.endsWith(target) && mention.test(current.slice(0, current.length - target.length));
+      };
+      const inlineConflict = () => [...draftElement.querySelectorAll('img,video,audio,a,[data-slate-void="true"]')].some(node => !input.allowMention || !/^@/.test((node.textContent || '').trim()));
       const entry = { element, scope, mode: input.mode, draftElement, dispatched: false, blocked: false, armed: false, armedAt: null, point: null, pointerStarted: false };
       const videoMatches = () => {
         const route = new URL(location.href), routeId = /^\/video\/(\d+)\/?$/.exec(route.pathname)?.[1] || route.searchParams.get('modal_id') || route.searchParams.get('aweme_id');
@@ -140,11 +163,11 @@ async function prepareCommentPointer(page, locator, { check, signal, expectedVid
         if (marked.length !== 1 || marked[0] !== element || currentScopes.length !== 1 || currentScopes[0] !== scope || !scope.isConnected || !scope.contains(element) || scope.closest(privateArea) || scope.querySelector(privateArea) || !ownerMatches() || !element.isConnected || element.closest(privateArea) || !visible(element) || element.closest('[disabled],[aria-disabled="true"],[data-disabled="true"],.disabled') || !iconMatches() || !videoMatches()) return null;
         const editors = editorsInScope();
         if (input.mode === 'lazy' ? editors.length > 1 : editors.length !== 1 || editors[0] !== draftElement) return null;
-        if ([...scope.querySelectorAll('[data-e2e="comment-reply-target"],.PPsJmqBy')].some(visible) || /^回复\s*[@＠]/.test(draftElement?.getAttribute('aria-label') || '') || [...scope.querySelectorAll('input[type="file"]')].some(file => file.files?.length || file.value)) return null;
+        if (!input.reply && [...scope.querySelectorAll('[data-e2e="comment-reply-target"],.PPsJmqBy')].some(visible) || !input.reply && /^回复\s*[@＠]/.test(draftElement?.getAttribute('aria-label') || '') || !input.reply && [...scope.querySelectorAll('.public-DraftEditorPlaceholder-inner')].some(node => /^回复\s*[@＠]/.test((node.textContent || '').trim())) || [...scope.querySelectorAll('input[type="file"]')].some(file => file.files?.length || file.value)) return null;
         if ([...document.querySelectorAll('[data-e2e="im-dialog"],#captcha_container,[id^="captcha_container"],[data-e2e="captcha-container"]')].some(visible)) return null;
         if ([...document.querySelectorAll('body *')].some(node => !node.childElementCount && visible(node) && !node.closest(privateArea) && /扫码登录|验证码登录|登录后即可|手机扫码登录|请完成下方验证|请完成验证|安全验证|拖动滑块/.test(node.textContent || ''))) return null;
         const self = readSelf(); if (!self.ready || self.ownProfileId !== input.ownProfileId) return null;
-        if (draftElement && (!draftElement.isConnected || clean(draftElement instanceof HTMLInputElement || draftElement instanceof HTMLTextAreaElement ? draftElement.value : draftElement.innerText) !== input.expectedDraft || draftElement.querySelector('img,video,audio,a,[data-slate-void="true"]'))) return null;
+        if (draftElement && (!draftElement.isConnected || !draftMatches(draftElement instanceof HTMLInputElement || draftElement instanceof HTMLTextAreaElement ? draftElement.value : draftElement.innerText) || inlineConflict())) return null;
         const r = element.getBoundingClientRect(), rawX = input.mode === 'submit' ? r.x + r.width / 2 : r.x + Math.min(16, r.width / 2), rawY = r.y + r.height / 2;
         const x = heldPoint && input.mode !== 'submit' ? heldPoint.clickX : Math.round(rawX), y = heldPoint && input.mode !== 'submit' ? heldPoint.clickY : Math.round(rawY);
         if (r.width < 2 || r.height < 2 || !Number.isSafeInteger(x) || !Number.isSafeInteger(y) || x < r.left || y < r.top || x >= r.right || y >= r.bottom || x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) return null;
@@ -168,7 +191,7 @@ async function prepareCommentPointer(page, locator, { check, signal, expectedVid
       entries[input.token] = entry;
       element.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'instant' });
       return true;
-    }, { token, mode, expectedVideoId, expectedDraft, ownProfileId: currentSelf.ownProfileId, icon: nativeIcon ? NATIVE_PUBLISH_ICON : null });
+    }, { token, mode, expectedVideoId, expectedDraft, reply, allowMention: Boolean(allowMention), ownProfileId: currentSelf.ownProfileId, icon: nativeIcon ? NATIVE_PUBLISH_ICON : null });
     if (!installed) throw new Error('评论输入几何见证未安装，未输入。');
     const readPoint = () => page.evaluate(token => window.__deepseekCommentGeometryInputs?.[token]?.readPoint() || null, token);
     let previous, stablePoint, stableSamples = 0;
@@ -191,6 +214,160 @@ async function prepareCommentPointer(page, locator, { check, signal, expectedVid
   } catch (error) { await close(); throw error; }
 }
 
+
+// 主页作品弹层默认收起评论面板。复用现有输入框和评论行判断，只在缺失时点一次评论入口。
+export async function ensureCommentPanel(page, { check = async () => {}, signal } = {}) {
+  const panelReady = () => page.evaluate(() => {
+    const visible = element => {
+      const rect = element.getBoundingClientRect(), style = getComputedStyle(element);
+      return rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.right > 0 && rect.top < innerHeight && rect.left < innerWidth && style.display !== 'none' && style.visibility !== 'hidden';
+    };
+    return [...document.querySelectorAll('.comment-input-container,.comment-input-inner-container,[data-e2e="comment-input"]')].some(visible) || [...document.querySelectorAll('[data-e2e="comment-item"]')].some(visible);
+  });
+  if (await panelReady()) return { expanded: false, alreadyOpen: true };
+  // 主页弹层会同时挂多个评论图标，只有当前作品的那一个在视口内；按坐标点击唯一可见入口。
+  const entry = await page.evaluate(() => {
+    const visible = element => {
+      const rect = element.getBoundingClientRect(), style = getComputedStyle(element);
+      return rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.right > 0 && rect.top < innerHeight && rect.left < innerWidth && style.display !== 'none' && style.visibility !== 'hidden';
+    };
+    const icons = [...document.querySelectorAll('[data-e2e="feed-comment-icon"]')].filter(visible);
+    if (icons.length !== 1) return null;
+    const rect = icons[0].getBoundingClientRect();
+    return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+  });
+  if (!entry) return { expanded: false, reason: 'comment-entry-unavailable' };
+  await check(); stop(signal);
+  await page.mouse.click(entry.x, entry.y);
+  for (let attempt = 0; attempt < 12; attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 300));
+    stop(signal);
+    if (await panelReady()) return { expanded: true };
+  }
+  return { expanded: false, reason: 'comment-panel-not-ready' };
+}
+
+async function readReplyComposer(page, { commentId, text } = {}) {
+  return page.evaluate(({ commentId, text }) => {
+    const visible = element => {
+      const rect = element.getBoundingClientRect(), style = getComputedStyle(element);
+      return rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.right > 0 && rect.top < innerHeight && rect.left < innerWidth && style.display !== 'none' && style.visibility !== 'hidden';
+    };
+    const expectedText = typeof text === 'string' ? text.trim() : '';
+    return [...document.querySelectorAll('[contenteditable="true"],textarea')].filter(element => visible(element) && !element.closest('[data-e2e="im-dialog"],[data-e2e="danmaku-container"]')).map(element => {
+      const scope = element.closest('.comment-input-container,.comment-input-inner-container,[data-e2e="comment-input"]');
+      const target = scope?.querySelector('[data-e2e="comment-reply-target"],.PPsJmqBy');
+      const targetId = target?.getAttribute('data-comment-id') || target?.getAttribute('data-reply-comment-id') || target?.getAttribute('data-cid') || null;
+      const targetText = (target?.innerText || target?.textContent || '').trim();
+      const aria = element.getAttribute('aria-label') || '';
+      // 2026-11-16 真机：回复态只显示“回复@昵称”占位符，输入框内没有提及节点，也没有回复目标元素。
+      const placeholder = (scope?.querySelector('.public-DraftEditorPlaceholder-inner')?.textContent || '').trim();
+      const draftText = String(element instanceof HTMLTextAreaElement ? element.value : element.innerText ?? '').replace(/[\u200B-\u200F\uFEFF]/g, '').trim();
+      const marker = target ? 'target' : /^回复\s*[@＠]/.test(aria) ? 'aria' : /^回复\s*[@＠]/.test(placeholder) ? 'placeholder' : /^@[^\n\r@]{1,80}$/.test(draftText) ? 'mention' : null;
+      const idKnown = /^\d{1,64}$/.test(targetId || '');
+      const idMatches = idKnown && targetId === commentId;
+      const textMatches = Boolean(expectedText && (targetText === expectedText || targetText.includes(expectedText) || aria.includes(expectedText)));
+      return { marker, targetId, targetText, placeholder, idMatches, textMatches, valid: marker === 'placeholder' || marker === 'mention' || Boolean(marker) && (idKnown ? idMatches : textMatches) };
+    }).find(item => item.valid) || null;
+  }, { commentId, text });
+}
+
+// 只点击稳定 commentId 对应评论行里唯一的“回复”入口，并核对输入框确实进入同一回复状态。
+async function openCommentReply(page, { expectedVideoId, replyToIndex, replyToCommentId, replyToText }, check, signal) {
+  const deadline = Date.now() + 4000;
+  let last = 'comment-reply-unavailable';
+  while (Date.now() < deadline) {
+    stop(signal); await check();
+    const token = `comment-reply-${Math.random().toString(16).slice(2)}`;
+    const marked = await page.evaluate(({ expectedVideoId, index, commentId, text, token }) => {
+      const visible = element => {
+        const rect = element.getBoundingClientRect(), style = getComputedStyle(element);
+        return rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.right > 0 && rect.top < innerHeight && rect.left < innerWidth && style.display !== 'none' && style.visibility !== 'hidden';
+      };
+      const owned = (row, selector) => [...row.querySelectorAll(selector)].filter(element => element.closest('[data-e2e="comment-item"]') === row);
+      const commentIdOf = row => {
+        const ids = [row.getAttribute('data-comment-id'), /^comment_(\d+)$/.exec(row.id)?.[1], ...owned(row, '[id^="tooltip_"]').map(element => /^tooltip_(\d+)$/.exec(element.id)?.[1])].filter(Boolean);
+        return new Set(ids).size === 1 && /^\d{1,64}$/.test(ids[0]) ? ids[0] : null;
+      };
+      for (const node of document.querySelectorAll('[data-deepseek-reply-token]')) node.removeAttribute('data-deepseek-reply-token');
+      const rows = [...document.querySelectorAll('[data-e2e="comment-item"]')].filter(visible);
+      const top = rows.filter(row => !row.parentElement?.closest('[data-e2e="comment-item"]'));
+      const row = top.find(candidate => commentIdOf(candidate) === commentId);
+      if (!row) return { token: null, reason: top.length ? 'comment-reply-missing' : 'comment-reply-unavailable', topCount: top.length };
+      const owner = row.closest('[data-aweme-id],[data-video-id]');
+      const rowVideoId = owner?.getAttribute('data-aweme-id') || owner?.getAttribute('data-video-id') || expectedVideoId;
+      if (rowVideoId !== expectedVideoId) return { token: null, reason: 'comment-reply-wrong-video', topCount: top.length };
+      const content = owned(row, '[data-e2e="comment-content"],.comment-item-content,.FduGc_lz > .Sh1Da424').filter(visible);
+      const actualText = content.length === 1 ? (content[0].innerText || content[0].textContent || '').trim() : '';
+      if (!actualText || (text && actualText.slice(0, text.length) !== text)) return { token: null, reason: 'comment-reply-target-changed', topCount: top.length };
+      const actualIndex = top.indexOf(row) + 1;
+      const buttons = [...row.querySelectorAll('button,span,div,a,[role="button"]')].filter(element => {
+        if (element.closest('[data-e2e="comment-item"]') !== row || !visible(element)) return false;
+        const label = (element.getAttribute('aria-label') || element.getAttribute('title') || '').trim();
+        const textLabel = (element.textContent || '').trim();
+        return (element.childElementCount === 0 && textLabel === '回复' || /^(?:回复|回复评论)$/.test(label));
+      });
+      if (buttons.length !== 1) return { token: null, reason: buttons.length > 1 ? 'comment-reply-ambiguous' : 'comment-reply-missing', topCount: top.length };
+      buttons[0].setAttribute('data-deepseek-reply-token', token);
+      return { token, topCount: top.length, actualIndex };
+    }, { expectedVideoId, index: replyToIndex, commentId: replyToCommentId, text: replyToText, token });
+    if (marked?.reason) last = marked.reason;
+    const target = marked?.token ? page.locator(`[data-deepseek-reply-token="${token}"]`) : null;
+    try {
+      if (target && (await target.count()) === 1) {
+        await target.click();
+        for (let attempt = 0; attempt < 12; attempt++) {
+          await waitForCommentTick(250, undefined, { signal });
+          stop(signal);
+          const replied = await readReplyComposer(page, { commentId: replyToCommentId, text: replyToText });
+          if (replied) {
+            // 记住这次确认过的回复输入区；输入文字后占位符会消失，仍按同一区域核对回复态。
+            await page.evaluate(({ commentId }) => {
+              const visible = element => { const rect = element.getBoundingClientRect(), style = getComputedStyle(element); return rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.right > 0 && rect.top < innerHeight && rect.left < innerWidth && style.display !== 'none' && style.visibility !== 'hidden'; };
+              const editors = [...document.querySelectorAll('[contenteditable="true"],textarea')].filter(element => visible(element) && !element.closest('[data-e2e="im-dialog"],[data-e2e="danmaku-container"]'));
+              if (editors.length !== 1) return false;
+              const scope = editors[0].closest('.comment-input-container,.comment-input-inner-container,[data-e2e="comment-input"]');
+              if (!scope) return false;
+              scope.setAttribute('data-deepseek-reply-comment', commentId); return true;
+            }, { commentId: replyToCommentId }).catch(() => false);
+            return { replied: true, index: marked.actualIndex || replyToIndex, commentId: replyToCommentId, text: replyToText };
+          }
+          last = 'comment-reply-not-activated';
+        }
+        throw new Error('点击回复后输入框没有进入回复状态，未输入。');
+      }
+    } finally {
+      await page.evaluate(currentToken => { for (const node of document.querySelectorAll('[data-deepseek-reply-token]')) if (node.getAttribute('data-deepseek-reply-token') === currentToken) node.removeAttribute('data-deepseek-reply-token'); }, token).catch(() => {});
+    }
+    await waitForCommentTick(250, undefined, { signal });
+  }
+  throw new Error(`没有找到可回复的评论（${last}），未输入。`);
+}
+
+async function revealReplyThread(page, { expectedVideoId, commentId }, check, signal) {
+  const token = `comment-thread-${randomUUID()}`;
+  const marked = await page.evaluate(({ expectedVideoId, commentId, token }) => {
+    const visible = element => { const rect = element.getBoundingClientRect(), style = getComputedStyle(element); return rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.right > 0 && rect.top < innerHeight && rect.left < innerWidth && style.display !== 'none' && style.visibility !== 'hidden'; };
+    const owned = (row, selector) => [...row.querySelectorAll(selector)].filter(element => element.closest('[data-e2e="comment-item"]') === row);
+    const commentIdOf = row => { const ids = [row.getAttribute('data-comment-id'), /^comment_(\d+)$/.exec(row.id)?.[1], ...owned(row, '[id^="tooltip_"]').map(element => /^tooltip_(\d+)$/.exec(element.id)?.[1])].filter(Boolean); return new Set(ids).size === 1 ? ids[0] : null; };
+    const row = [...document.querySelectorAll('[data-e2e="comment-item"]')].find(candidate => visible(candidate) && !candidate.parentElement?.closest('[data-e2e="comment-item"]') && commentIdOf(candidate) === commentId);
+    if (!row) return null;
+    const owner = row.closest('[data-aweme-id],[data-video-id]'), rowVideoId = owner?.getAttribute('data-aweme-id') || owner?.getAttribute('data-video-id') || expectedVideoId;
+    const hasVisibleNested = [...row.querySelectorAll('[data-e2e="comment-item"]')].some(child => child.parentElement?.closest('[data-e2e="comment-item"]') === row && visible(child));
+    if (rowVideoId !== expectedVideoId || hasVisibleNested) return { expanded: true };
+    const controls = owned(row, 'button,span,div,a,[role="button"]').filter(element => { const label = `${element.getAttribute('aria-label') || ''} ${element.getAttribute('title') || ''} ${element.textContent || ''}`.trim(); return visible(element) && /(?:查看|展开).{0,8}(?:条)?回复/.test(label); });
+    if (controls.length !== 1) return { expanded: false };
+    controls[0].setAttribute('data-deepseek-thread-token', token);
+    return { expanded: false, token };
+  }, { expectedVideoId, commentId, token });
+  if (!marked?.token) return Boolean(marked?.expanded);
+  try {
+    const control = page.locator(`[data-deepseek-thread-token="${token}"]`);
+    if (await control.count() !== 1) return false;
+    await check(); await control.click(); await waitForCommentTick(250, undefined, { signal });
+    return true;
+  } finally { await page.evaluate(currentToken => { for (const node of document.querySelectorAll('[data-deepseek-thread-token]')) if (node.getAttribute('data-deepseek-thread-token') === currentToken) node.removeAttribute('data-deepseek-thread-token'); }, token).catch(() => {}); }
+}
 
 async function activateCommentEditor(page, expectedVideoId, check, signal) {
   let editors = page.locator(EDITORS).filter({ visible: true });
@@ -324,7 +501,8 @@ export function readCommentSelfIdentity() {
 export function readCommentDom(input) {
   const expectedVideoId = typeof input === 'string' ? input : input?.expectedVideoId;
   const trustedOwnProfileId = typeof input === 'object' && input !== null ? input.ownProfileId : null;
-  if (typeof input !== 'string' && (!input || Object.keys(input).some(key => !['expectedVideoId', 'ownProfileId'].includes(key)) || typeof trustedOwnProfileId !== 'string' || !/^[A-Za-z0-9_-]{5,300}$/.test(trustedOwnProfileId))) return { rows: [] };
+  const includeReplies = typeof input === 'object' && input !== null && input.includeReplies === true;
+  if (typeof input !== 'string' && (!input || Object.keys(input).some(key => !['expectedVideoId', 'ownProfileId', 'includeReplies'].includes(key)) || typeof trustedOwnProfileId !== 'string' || !/^[A-Za-z0-9_-]{5,300}$/.test(trustedOwnProfileId))) return { rows: [] };
   const visible = element => { const r = element.getBoundingClientRect(), s = getComputedStyle(element); return r.width > 0 && r.height > 0 && r.bottom > 0 && r.right > 0 && r.top < innerHeight && r.left < innerWidth && s.display !== 'none' && s.visibility !== 'hidden'; };
   const profileId = anchor => {
     try { const url = new URL(anchor.getAttribute('href'), 'https://www.douyin.com/'); return url.origin === 'https://www.douyin.com' && !url.username && !url.password ? /^\/user\/([A-Za-z0-9_-]{5,300})\/?$/.exec(url.pathname)?.[1] || null : null; } catch { return null; }
@@ -336,7 +514,7 @@ export function readCommentDom(input) {
   const ownProfile = trustedOwnProfileId || navigationProfile;
   const pageVideoIds = new Set();
   try { const url = new URL(location.href), id = /^\/video\/(\d+)\/?$/.exec(url.pathname)?.[1] || url.searchParams.get('modal_id') || url.searchParams.get('aweme_id'); if (/^\d{1,64}$/.test(id || '')) pageVideoIds.add(id); } catch {}
-  for (const player of document.querySelectorAll('[data-e2e="player-container"]')) {
+  for (const player of document.querySelectorAll('[data-e2e="player-container"],[data-e2e="feed-active-video"]')) {
     if (!visible(player) || player.closest(privateArea) || ![...player.querySelectorAll('video')].some(visible)) continue;
     const id = /(?:^|\s)video_(\d+)(?:\s|$)/.exec(player.className || '')?.[1]; if (id) pageVideoIds.add(id);
   }
@@ -367,15 +545,21 @@ export function readCommentDom(input) {
     return value === null ? null : value.trim();
   };
 
+  const ownedFor = (row, selector) => [...row.querySelectorAll(selector)].filter(element => element.closest('[data-e2e="comment-item"]') === row);
+  const commentIdOf = row => {
+    const ids = [row.getAttribute('data-comment-id'), /^comment_(\d+)$/.exec(row.id)?.[1], ...ownedFor(row, '[id^="tooltip_"]').map(element => /^tooltip_(\d+)$/.exec(element.id)?.[1])].filter(Boolean);
+    return new Set(ids).size === 1 && /^\d{1,64}$/.test(ids[0]) ? ids[0] : null;
+  };
   const result = [];
   for (const row of document.querySelectorAll('[data-e2e="comment-item"]')) {
-    if (!visible(row) || row.closest(privateArea) || row.parentElement?.closest('[data-e2e="comment-item"]')) continue;
-    const owned = selector => [...row.querySelectorAll(selector)].filter(element => element.closest('[data-e2e="comment-item"]') === row);
+    if (!visible(row) || row.closest(privateArea) || (!includeReplies && row.parentElement?.closest('[data-e2e="comment-item"]'))) continue;
+    const owned = selector => ownedFor(row, selector);
+    const parentRow = row.parentElement?.closest('[data-e2e="comment-item"]');
+    const parentCommentId = parentRow ? commentIdOf(parentRow) : null;
     const ancestorVideoId = row.closest('[data-aweme-id],[data-video-id]')?.getAttribute('data-aweme-id') || row.closest('[data-video-id]')?.getAttribute('data-video-id');
     if (ancestorVideoId && ancestorVideoId !== expectedVideoId) continue;
     const videoBound = ancestorVideoId === expectedVideoId || pageVideoIds.size === 1 && pageVideoIds.has(expectedVideoId);
-    const ids = [row.getAttribute('data-comment-id'), /^comment_(\d+)$/.exec(row.id)?.[1], ...owned('[id^="tooltip_"]').map(element => /^tooltip_(\d+)$/.exec(element.id)?.[1])].filter(Boolean);
-    const rawId = new Set(ids).size === 1 ? ids[0] : null;
+    const rawId = commentIdOf(row);
     const content = owned('[data-e2e="comment-content"],.comment-item-content,.FduGc_lz > .Sh1Da424');
     const textNode = content.length === 1 ? content[0] : null;
     const reconstructed = textNode ? readOwnedCommentText(textNode, row) : null;
@@ -389,7 +573,7 @@ export function readCommentDom(input) {
     const pending = /^(?:sending|pending|reviewing)$/.test(status) || owned('[data-e2e="comment-pending"],[aria-busy="true"],[class*="sending" i]').length > 0 || labels.some(value => /^(?:待审核|审核中|评论审核中|发送中|发布中)$/.test(value));
     const failed = /^(?:failed|rejected|error)$/.test(status) || owned('[data-e2e="comment-failed"],[class*="sendFail"]').length > 0 || labels.some(value => /^(?:审核未通过|发布失败|评论未发布|发送失败)$/.test(value));
     const sent = /^(?:sent|published|success)$/.test(status) || mine && /^\d{1,64}$/.test(rawId || '') && !pending && !failed;
-    result.push({ commentId: /^\d{1,64}$/.test(rawId || '') ? rawId : null, videoId: ancestorVideoId || expectedVideoId, text, mine, sent, pending, failed });
+    result.push({ commentId: rawId, ...(includeReplies ? { parentCommentId } : {}), videoId: ancestorVideoId || expectedVideoId, text, mine, sent, pending, failed });
   }
   return { rows: result };
 }
@@ -397,7 +581,15 @@ export function readCommentDom(input) {
 function assertVideo(state, expectedVideoId) {
   if (state?.loginRequired || state?.verificationRequired || state?.unsupportedPage || state?.privateChatVisible || state?.blocked || state?.video?.id !== expectedVideoId || state.video.readyState < 2) throw new Error('当前作品、登录状态或页面遮挡无法核对，未发布评论。');
   const url = state.video.url || state.url;
-  if (url) { let current; try { current = new URL(url); } catch {} if (!current || current.origin !== 'https://www.douyin.com' || /^\/video\/(\d+)\/?$/.exec(current.pathname)?.[1] !== expectedVideoId) throw new Error('当前作品链接与预期不一致，未发布评论。'); }
+  if (url) {
+    let current;
+    try { current = new URL(url); } catch {}
+    // 详情页用 /video/<id>，主页弹层用 ?modal_id=<id> 或 ?aweme_id=<id>，都代表当前作品。
+    const routeId = current?.origin === 'https://www.douyin.com'
+      ? /^\/video\/(\d+)\/?$/.exec(current.pathname)?.[1] || current.searchParams.get('modal_id') || current.searchParams.get('aweme_id')
+      : null;
+    if (!current || current.origin !== 'https://www.douyin.com' || routeId !== expectedVideoId) throw new Error('当前作品链接与预期不一致，未发布评论。');
+  }
 }
 
 export class CommentBrowser {
@@ -409,21 +601,34 @@ export class CommentBrowser {
     this.controller = controller ?? new BrowserController({ source, videoLimits: this.videoLimits }); this.ownsController = !controller;
     this.receiptsFile = path.join(stateDir, 'comment-browser-receipts.json'); this.guardFile = path.join(stateDir, 'comment-post.guard');
   }
-  receipts() { try { const value = JSON.parse(fs.readFileSync(this.receiptsFile, 'utf8')); if (!value || value.version !== 1 || !Array.isArray(value.operations) || value.operations.some(item => !item || typeof item.operationId !== 'string' || !/^\d{1,64}$/.test(item.videoId) || !['clicking', 'confirmed', 'uncertain'].includes(item.status) || item.baseline && !checkReceiptBaseline(item, 'public-comment').available)) throw Error(); return value; } catch (error) { if (error.code === 'ENOENT') return { version: 1, operations: [] }; throw new Error('原评论发布收据无法核对，未自动重发。'); } }
+  receipts() { try { const value = JSON.parse(fs.readFileSync(this.receiptsFile, 'utf8')); if (!value || value.version !== 1 || !Array.isArray(value.operations) || value.operations.some(item => !item || typeof item.operationId !== 'string' || !/^\d{1,64}$/.test(item.videoId) || !['clicking', 'confirmed', 'uncertain', 'resolved-confirmed', 'resolved-not-sent'].includes(item.status) || item.baseline && !checkReceiptBaseline(item, 'public-comment').available)) throw Error(); return value; } catch (error) { if (error.code === 'ENOENT') return { version: 1, operations: [] }; throw new Error('原评论发布收据无法核对，未自动重发。'); } }
   record(operation) { const value = this.receipts(), index = value.operations.findIndex(item => item.operationId === operation.operationId), stored = preserveReceiptBaseline(index < 0 ? null : value.operations[index], operation, 'public-comment'); if (index < 0) value.operations.push(stored); else value.operations[index] = stored; write(this.receiptsFile, value); }
+  // 把人工核对结果写回发布收据：确认未发送后允许同作品重试，确认已发送则继续阻止重复发布。
+  markResolved({ videoId, operationId, outcome } = {}) {
+    if (typeof videoId !== 'string' || !/^\d{1,64}$/.test(videoId) || !['confirmed', 'not-sent'].includes(outcome) || operationId !== undefined && (typeof operationId !== 'string' || !operationId || operationId.length > 200)) throw new TypeError('核对评论收据需要作品编号和实际发送结果。');
+    const value = this.receipts(), matches = value.operations.filter(item => item.videoId === videoId && (operationId === undefined || item.operationId === operationId));
+    if (!matches.length) return { updated: 0 };
+    if (outcome === 'not-sent' && matches.some(item => item.status === 'confirmed')) throw new Error('评论收据已确认发布，不能改为未发送。');
+    const status = outcome === 'confirmed' ? 'resolved-confirmed' : 'resolved-not-sent', resolvedAt = new Date().toISOString();
+    for (const item of matches) { item.status = status; item.resolvedAt = resolvedAt; }
+    write(this.receiptsFile, value); return { updated: matches.length, status };
+  }
   acquire() { fs.mkdirSync(this.stateDir, { recursive: true }); let descriptor; try { descriptor = fs.openSync(this.guardFile, 'wx', 0o600); } catch (error) { if (error.code === 'EEXIST') throw new Error('其他评论仍在处理，或发布锁需要核对；未抢锁重试。'); throw error; } const owner = { pid: process.pid, token: randomUUID() }; try { fs.writeFileSync(descriptor, JSON.stringify(owner)); } finally { fs.closeSync(descriptor); } return () => { const current = JSON.parse(fs.readFileSync(this.guardFile, 'utf8')); if (current?.pid === owner.pid && current.token === owner.token) fs.unlinkSync(this.guardFile); }; }
   async gate(signal) { stop(signal); const state = this.videoLimits.state(); if (!state.allowed) throw new Error(state.reason || '有限观看时段已结束，未发布评论。'); }
-  async post({ expectedVideoId, text, ...extra } = {}, { signal: parentSignal, authorize, autonomousRunId } = {}) {
-    if (typeof expectedVideoId !== 'string' || !/^\d{1,64}$/.test(expectedVideoId) || Object.keys(extra).length) throw new TypeError('评论只能指定当前作品编号与纯文字。');
+  async post({ expectedVideoId, text, replyToIndex, replyToCommentId, replyToText, ...extra } = {}, { signal: parentSignal, authorize, autonomousRunId } = {}) {
+    const hasReply = replyToIndex !== undefined || replyToCommentId !== undefined || replyToText !== undefined;
+    if (typeof expectedVideoId !== 'string' || !/^\d{1,64}$/.test(expectedVideoId) || hasReply && (!Number.isSafeInteger(replyToIndex) || replyToIndex < 1 || replyToIndex > COMMENT_LIST_LIMIT || !validCommentId(replyToCommentId) || typeof replyToText !== 'string' || !replyToText.trim() || replyToText.length > COMMENT_TEXT_LIMIT) || Object.keys(extra).length) throw new TypeError('评论只能指定当前作品编号、纯文字和完整回复目标。');
+    // 回复序号对应当前评论面板中可见的顶层评论顺序；不传则保持只发新评论。
+    const reply = hasReply ? { index: replyToIndex, commentId: replyToCommentId, text: replyToText.trim() } : null;
     text = validateCommentText(text);
     if (typeof authorize !== 'function' || typeof authorize.beginDispatch !== 'function') return { confirmed: false, deliveryUncertain: false, videoId: expectedVideoId, reason: '评论缺少可信本机许可与最终短输入控制，未发布。' };
     const interrupt = new AbortController(), signal = AbortSignal.any([interrupt.signal, ...(parentSignal ? [parentSignal] : [])]);
     const authorized = async phase => { stop(signal); if (await authorize({ phase, videoId: expectedVideoId }) !== true) throw new Error('自主评论许可已撤回，未继续发布。'); stop(signal); };
     await authorized('prepare'); await this.gate(signal);
-    const release = this.acquire(), operation = { operationId: randomUUID(), videoId: expectedVideoId, startedAt: new Date().toISOString(), status: 'clicking' };
+    const release = this.acquire(), operation = { operationId: randomUUID(), videoId: expectedVideoId, ...(reply ? { replyToIndex: reply.index, replyToCommentId: reply.commentId, replyToText: reply.text } : {}), startedAt: new Date().toISOString(), status: 'clicking' };
     let clicked = false, dispatched = false, receiptWritten = false;
     try {
-      if (this.receipts().operations.some(item => item.videoId === expectedVideoId)) throw new Error('同一作品已有发布或待核对评论收据，未再次点击。');
+      if (this.receipts().operations.some(item => item.videoId === expectedVideoId && item.status !== 'resolved-not-sent')) throw new Error('同一作品已有发布或待核对评论收据，未再次点击。');
       return await this.controller.withPage(async page => {
         let ownProfileId;
         const checkSelf = async () => {
@@ -433,6 +638,10 @@ export class CommentBrowser {
         };
         const checkPage = async () => { await authorized('monitor'); await this.gate(signal); assertVideo(await page.evaluate(readPageState), expectedVideoId); await checkSelf(); };
         await checkPage();
+        const panel = await ensureCommentPanel(page, { check: checkPage, signal });
+        if (!panel?.expanded && !panel?.alreadyOpen) return { confirmed: false, deliveryUncertain: false, videoId: expectedVideoId, needsUserAction: true, reason: `评论面板未打开（${panel?.reason || 'unknown'}）。` };
+        let replyTarget = null;
+        if (reply) replyTarget = await openCommentReply(page, { expectedVideoId, replyToIndex: reply.index, replyToCommentId: reply.commentId, replyToText: reply.text }, checkPage, signal);
         const editors = await activateCommentEditor(page, expectedVideoId, checkPage, signal);
         if (await editors.count() !== 1) return { confirmed: false, deliveryUncertain: false, videoId: expectedVideoId, needsUserAction: true, reason: '当前页面没有唯一可核对的评论输入框，需要先打开评论面板或等待适配。' };
         const editor = editors;
@@ -442,9 +651,23 @@ export class CommentBrowser {
         if (initial.ambiguous) return { confirmed: false, deliveryUncertain: false, videoId: expectedVideoId, needsUserAction: true, reason: '当前评论区域存在多个发布控件，未填写或发布。' };
         const draft = () => editor.evaluate(element => element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement ? element.value : element.innerText);
         const hasFile = () => root.locator('input[type="file"]').evaluateAll(inputs => inputs.some(input => input.files?.length || input.value));
-        if (cleanDraft(await draft()) || await editor.locator('img,video,audio,a,[data-slate-void="true"]').count() || await hasFile()) return { confirmed: false, deliveryUncertain: false, videoId: expectedVideoId, reason: '评论输入框已有草稿或媒体内容，已保留原内容。' };
-        if (await root.locator('[data-e2e="comment-reply-target"],.PPsJmqBy').filter({ visible: true }).count() || await editor.getAttribute('aria-label').then(value => /回复\s*[@＠]/.test(value || ''))) return { confirmed: false, deliveryUncertain: false, videoId: expectedVideoId, reason: '当前输入框处于回复他人的状态，未改发回复或@。' };
-        const before = await page.evaluate(readCommentDom, { expectedVideoId, ownProfileId });
+        const inlineConflict = async () => Boolean(reply) ? await editor.locator('img,video,audio,a,[data-slate-void="true"]').evaluateAll(nodes => nodes.some(node => !/^@/.test((node.textContent || '').trim()))) : await editor.locator('img,video,audio,a,[data-slate-void="true"]').count() > 0;
+        if (!draftCleared(await draft(), Boolean(reply)) || await inlineConflict() || await hasFile()) return { confirmed: false, deliveryUncertain: false, videoId: expectedVideoId, reason: '评论输入框已有草稿或媒体内容，已保留原内容。' };
+        if (!reply && (await root.locator('[data-e2e="comment-reply-target"],.PPsJmqBy').filter({ visible: true }).count() || await editor.getAttribute('aria-label').then(value => /回复\s*[@＠]/.test(value || '')) || await root.locator('.public-DraftEditorPlaceholder-inner').evaluateAll(nodes => nodes.some(node => /^回复\s*[@＠]/.test((node.textContent || '').trim()))))) return { confirmed: false, deliveryUncertain: false, videoId: expectedVideoId, reason: '当前输入框处于回复他人的状态，未改发回复或@。' };
+        const replyStillActive = async () => {
+          if (!reply) return true;
+          if (await readReplyComposer(page, { commentId: reply.commentId, text: reply.text })) return true;
+          return page.evaluate(({ commentId }) => {
+            const visible = element => { const rect = element.getBoundingClientRect(), style = getComputedStyle(element); return rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.right > 0 && rect.top < innerHeight && rect.left < innerWidth && style.display !== 'none' && style.visibility !== 'hidden'; };
+            const editors = [...document.querySelectorAll('[contenteditable="true"],textarea')].filter(element => visible(element) && !element.closest('[data-e2e="im-dialog"],[data-e2e="danmaku-container"]'));
+            if (editors.length !== 1 || !editors[0].isConnected) return false;
+            const scope = editors[0].closest('.comment-input-container,.comment-input-inner-container,[data-e2e="comment-input"]');
+            return Boolean(scope?.isConnected && scope.getAttribute('data-deepseek-reply-comment') === commentId);
+          }, { commentId: reply.commentId });
+        };
+        const verifyReply = async () => { if (!reply) return; if (!await replyStillActive()) throw new Error('当前输入框的回复目标已变化，未发布。'); };
+        await verifyReply();
+        const before = await page.evaluate(readCommentDom, { expectedVideoId, ownProfileId, includeReplies: Boolean(reply) });
         operation.baseline = createCommentReceiptBaseline(operation, { rows: before.rows, ownProfileId, text });
         const knownIds = new Set(operation.baseline.knownIds);
         let monitoring = true, polling, prepared = false, releaseDispatch, submitPointer;
@@ -453,7 +676,8 @@ export class CommentBrowser {
         const check = async () => {
           if (clicked && await inputDispatched()) return;
           await checkPage();
-          if (await editors.count() !== 1 || !await composerScopeValid(root, expectedVideoId) || prepared && cleanDraft(await draft()) !== text || await hasFile() || await root.locator('[data-e2e="comment-reply-target"],.PPsJmqBy').filter({ visible: true }).count()) throw new Error('等待期间评论输入、发布目标或草稿发生变化，未发布。');
+          await verifyReply();
+          if (await editors.count() !== 1 || !await composerScopeValid(root, expectedVideoId) || prepared && !draftEquals(await draft(), text, Boolean(reply)) || await hasFile() || !reply && (await root.locator('[data-e2e="comment-reply-target"],.PPsJmqBy').filter({ visible: true }).count() || await root.locator('.public-DraftEditorPlaceholder-inner').evaluateAll(nodes => nodes.some(node => /^回复\s*[@＠]/.test((node.textContent || '').trim()))))) throw new Error('等待期间评论输入、发布目标或草稿发生变化，未发布。');
           if (send) {
             const latest = await findCommentSubmit(editor, expectedVideoId);
             if (await send.count() !== 1 || !latest.send || await latest.send.getAttribute('data-deepseek-comment-control') !== witnessId) throw new Error('等待期间评论发布控件发生变化或出现歧义，未发布。');
@@ -463,9 +687,11 @@ export class CommentBrowser {
         const timer = setInterval(() => { if (!monitoring || polling) return; polling = check().catch(async error => { if (monitoring && !await inputDispatched().catch(() => false)) interrupt.abort(error); }).finally(() => { polling = null; }); }, 40);
         try {
           await check();
-          const focus = await prepareCommentPointer(page, editor, { check, signal, expectedVideoId, mode: 'editor', expectedDraft: '', scope: root });
+          const focus = await prepareCommentPointer(page, editor, { check, signal, expectedVideoId, mode: 'editor', expectedDraft: '', reply: Boolean(reply), allowMention: Boolean(reply), scope: root });
           try { await focus.click(); } finally { await focus.close(); }
           stop(signal);
+          // 回复态可能预填“@昵称”，把光标移到末尾再追加正文，避免把文字插进提及中间。
+          if (reply) await page.keyboard.press('Control+End');
           // 使用浏览器真实文字输入触发受控编辑器；填写与页面回读一致后才等待发布按钮。
           await editor.pressSequentially(text, { delay: 10 }); stop(signal); prepared = true; await check();
           const selected = await findCommentSubmit(editor, expectedVideoId);
@@ -477,7 +703,7 @@ export class CommentBrowser {
           await check();
           const enabled = await waitCommentState(() => page.evaluate(token => { const element = [...document.querySelectorAll('[data-deepseek-comment-control]')].find(item => item.getAttribute('data-deepseek-comment-control') === token); return Boolean(element && !element.closest(':disabled,[aria-disabled="true"],[data-disabled="true"],.disabled') && (element.getAttribute('data-deepseek-comment-native-publish') !== token || element.classList.contains('jfGCpJo0'))); }, witnessId), check, signal, 3000);
           if (!enabled) throw Object.assign(new Error('评论发布控件尚不可用，草稿已保留，未点击。'), { needsUserAction: true });
-          submitPointer = await prepareCommentPointer(page, send, { check, signal, expectedVideoId, mode: 'submit', expectedDraft: text, nativeIcon: selected.nativeIcon, scope: root });
+          submitPointer = await prepareCommentPointer(page, send, { check, signal, expectedVideoId, mode: 'submit', expectedDraft: text, nativeIcon: selected.nativeIcon, reply: Boolean(reply), allowMention: Boolean(reply), scope: root });
           stop(signal); await check();
           if (await inputDispatched()) { dispatched = true; throw new Error('等待期间已发生发布输入，未再点击一次。'); }
           await authorized('before-click'); releaseDispatch = await authorize.beginDispatch(); if (typeof releaseDispatch !== 'function') throw new Error('最终评论输入未取得可释放的本机许可。');
@@ -488,24 +714,42 @@ export class CommentBrowser {
           for (let attempt = 0; attempt < 12; attempt++) {
             stop(signal); assertVideo(await page.evaluate(readPageState), expectedVideoId);
             await checkSelf();
-            const current = await page.evaluate(readCommentDom, { expectedVideoId, ownProfileId });
+            if (reply) await revealReplyThread(page, { expectedVideoId, commentId: replyTarget.commentId }, checkPage, signal).catch(() => false);
+            const current = await page.evaluate(readCommentDom, { expectedVideoId, ownProfileId, includeReplies: Boolean(reply) });
             await checkSelf();
-            const matches = current.rows.filter(item => item.commentId && !knownIds.has(item.commentId) && item.videoId === expectedVideoId && item.text === text && item.mine && item.sent && !item.failed && !item.pending);
+            const matches = current.rows.filter(item => item.commentId && !knownIds.has(item.commentId) && item.videoId === expectedVideoId && draftEquals(item.text, text, Boolean(reply)) && item.mine && item.sent && !item.failed && !item.pending && (!reply || item.parentCommentId === replyTarget.commentId));
             if (matches.length > 1 || new Set(current.rows.map(item => item.commentId).filter(Boolean)).size !== current.rows.filter(item => item.commentId).length) break;
-            if (matches.length === 1 && previousId === matches[0].commentId && !cleanDraft(await draft())) { const result = { confirmed: true, deliveryUncertain: false, operationId: operation.operationId, videoId: expectedVideoId, commentId: matches[0].commentId }; this.record({ ...operation, status: 'confirmed', completedAt: new Date().toISOString(), commentId: result.commentId }); return result; }
+            if (matches.length === 1 && previousId === matches[0].commentId && draftCleared(await draft(), Boolean(reply))) { const result = { confirmed: true, deliveryUncertain: false, operationId: operation.operationId, videoId: expectedVideoId, commentId: matches[0].commentId }; this.record({ ...operation, status: 'confirmed', completedAt: new Date().toISOString(), commentId: result.commentId }); return result; }
             previousId = matches.length === 1 ? matches[0].commentId : null;
             await page.waitForTimeout(150);
           }
           this.record({ ...operation, status: 'uncertain', completedAt: new Date().toISOString() });
-          return { confirmed: false, deliveryUncertain: true, operationId: operation.operationId, videoId: expectedVideoId, reason: '已尝试一次发布，但没有同作品的新本人评论编号与发出状态回读；请核对，未重试。' };
+          return { confirmed: false, deliveryUncertain: true, operationId: operation.operationId, videoId: expectedVideoId, baselineKnownIds: [...knownIds], reason: '已尝试一次发布，但没有同作品的新本人评论编号与发出状态回读；请核对，未重试。' };
         } catch (error) { dispatched ||= await inputDispatched().catch(() => false); throw error; }
-        finally { monitoring = false; clearInterval(timer); releaseDispatch?.(); await submitPointer?.close(); await page.evaluate(token => { const entry = window.__deepseekCommentInputs?.[token]; entry?.cleanup(); if (window.__deepseekCommentInputs) delete window.__deepseekCommentInputs[token]; for (const element of document.querySelectorAll('[data-deepseek-comment-control]')) if (element.getAttribute('data-deepseek-comment-control') === token) { element.removeAttribute('data-deepseek-comment-control'); if (element.getAttribute('data-deepseek-comment-native-publish') === token) element.removeAttribute('data-deepseek-comment-native-publish'); } }, witnessId).catch(() => {}); }
+        finally { monitoring = false; clearInterval(timer); releaseDispatch?.(); await submitPointer?.close(); await page.evaluate(token => { const entry = window.__deepseekCommentInputs?.[token]; entry?.cleanup(); if (window.__deepseekCommentInputs) delete window.__deepseekCommentInputs[token]; for (const element of document.querySelectorAll('[data-deepseek-comment-control]')) if (element.getAttribute('data-deepseek-comment-control') === token) { element.removeAttribute('data-deepseek-comment-control'); if (element.getAttribute('data-deepseek-comment-native-publish') === token) element.removeAttribute('data-deepseek-comment-native-publish'); } for (const element of document.querySelectorAll('[data-deepseek-reply-comment]')) element.removeAttribute('data-deepseek-reply-comment'); }, witnessId).catch(() => {}); }
       }, { signal, autonomousRunId });
     } catch (error) {
-      if (clicked || dispatched) { try { this.record({ ...operation, status: 'uncertain', completedAt: new Date().toISOString() }); } catch { /* 保留原始发布收据，未自动重试。 */ } return { confirmed: false, deliveryUncertain: true, operationId: operation.operationId, videoId: expectedVideoId, reason: '发布输入后的结果不明，请人工核对，未再次点击。' }; }
+      if (clicked || dispatched) { try { this.record({ ...operation, status: 'uncertain', completedAt: new Date().toISOString() }); } catch { /* 保留原始发布收据，未自动重试。 */ } return { confirmed: false, deliveryUncertain: true, operationId: operation.operationId, videoId: expectedVideoId, ...(Array.isArray(operation.baseline?.knownIds) ? { baselineKnownIds: [...operation.baseline.knownIds] } : {}), reason: '发布输入后的结果不明，请人工核对，未再次点击。' }; }
       if (receiptWritten) this.record({ ...operation, status: 'uncertain', completedAt: new Date().toISOString() });
       return { confirmed: false, deliveryUncertain: false, operationId: operation.operationId, videoId: expectedVideoId, ...(error.needsUserAction ? { needsUserAction: true } : {}), reason: error.message || '评论发布前检查未通过，草稿已保留。' };
     } finally { release(); }
+  }
+  // 只读复核已点击的评论是否真实出现：不点击、不写收据；页面不在目标作品时返回 unavailable 供调用方稍后重试。
+  async verifyPublished({ expectedVideoId, text, parentCommentId, knownIds = [] } = {}, { signal } = {}) {
+    if (typeof expectedVideoId !== 'string' || !/^\d{1,64}$/.test(expectedVideoId) || typeof text !== 'string' || !text.trim() || parentCommentId !== undefined && !validCommentId(parentCommentId) || !Array.isArray(knownIds)) throw new TypeError('复核评论需要作品编号、正文、父评论编号和基线编号。');
+    return this.controller.withPage(async page => {
+      const state = await page.evaluate(readPageState);
+      if (state?.video?.id !== expectedVideoId) return { found: false, unavailable: true, reason: '当前页面不在目标作品，稍后再复核。' };
+      const self = await page.evaluate(readCommentSelfIdentity);
+      if (!self.ready) return { found: false, unavailable: true, reason: '本人身份未就绪，稍后再复核。' };
+      const panel = await ensureCommentPanel(page);
+      if (!panel?.expanded && !panel?.alreadyOpen) return { found: false, unavailable: true, reason: `评论面板未打开（${panel?.reason || 'unknown'}）。` };
+      const current = await page.evaluate(readCommentDom, { expectedVideoId, ownProfileId: self.ownProfileId, includeReplies: Boolean(parentCommentId) });
+      const baseline = new Set(knownIds.filter(validCommentId));
+      const matches = current.rows.filter(item => item.commentId && !baseline.has(item.commentId) && item.videoId === expectedVideoId && draftEquals(item.text, text, Boolean(parentCommentId)) && item.mine && item.sent && !item.pending && !item.failed && (!parentCommentId || item.parentCommentId === parentCommentId));
+      if (matches.length === 1) return { found: true, commentId: matches[0].commentId };
+      return { found: false, ambiguous: matches.length > 1, reason: matches.length > 1 ? '复核出现多条候选，未自动确认。' : '暂未读到新评论。' };
+    }, { signal });
   }
   async close() { if (this.ownsController) await this.controller.close(); }
 }

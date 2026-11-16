@@ -6,13 +6,14 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import plugin, { apply, createNativeLaunchCommand } from '../dsh-plugin.mjs';
 import { TOOL_DEFINITIONS } from '../tool-definitions.mjs';
+import { dshNodeModules as sdk, nativeTest } from './sdk.mjs';
 
-const sdk = process.env.DSH_NODE_MODULES || 'F:/codex/DSH Desktop 2/resources/app/node_modules';
-const [{ Context }, { CommandRuntime }, { ToolRuntime }] = await Promise.all([
+const sdkModules = sdk ? await Promise.all([
   import(pathToFileURL(path.join(sdk, '@deepseek-ai/cordis/lib/index.js')).href),
   import(pathToFileURL(path.join(sdk, '@deepseek-ai/dsh-commands/lib/index.js')).href),
   import(pathToFileURL(path.join(sdk, '@deepseek-ai/dsh-tools/lib/index.js')).href),
-]);
+]) : [];
+const [{ Context } = {}, { CommandRuntime } = {}, { ToolRuntime } = {}] = sdkModules;
 
 async function fixture(t, { commands = true } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-native-launch-sdk-'));
@@ -44,7 +45,7 @@ async function until(check) {
   assert.fail('临时 SDK 的可选命令依赖未在限时内就绪。');
 }
 
-test('真实 CommandRuntime 直接执行打开命令，无需模型、视频工具或 API Key', async t => {
+nativeTest('真实 CommandRuntime 直接执行打开命令，无需模型、视频工具或 API Key', async t => {
   const f = await fixture(t), calls = [];
   const off = f.commands().register(createNativeLaunchCommand({ getController: async () => ({
     openBrowser: async options => { calls.push(options); return { opened: true, mode: 'prepare', paused: true, sessionChanged: false, message: '合成专用入口已打开，视频保持暂停。' }; },
@@ -59,7 +60,7 @@ test('真实 CommandRuntime 直接执行打开命令，无需模型、视频工�
   assert.equal('args' in f.events[0].data, false, '无效参数也不应进入持久命令输入日志');
 });
 
-test('真实命令拒绝任意参数、附件及预取消，不进入控制器', async t => {
+nativeTest('真实命令拒绝任意参数、附件及预取消，不进入控制器', async t => {
   const f = await fixture(t); let controllers = 0;
   const off = f.commands().register(createNativeLaunchCommand({ getController: async () => { controllers++; assert.fail('拒绝的命令不得创建控制器'); } }));
   t.after(off);
@@ -75,7 +76,7 @@ test('真实命令拒绝任意参数、附件及预取消，不进入控制器',
   assert.equal(JSON.stringify(f.events).includes('token=synthetic'), false);
 });
 
-test('卸载信号在异步控制器等待后仍拦截打开，真实 SDK 记录失败结果', async t => {
+nativeTest('卸载信号在异步控制器等待后仍拦截打开，真实 SDK 记录失败结果', async t => {
   const f = await fixture(t), lifetime = new AbortController(); let release, opened = 0;
   const ready = new Promise(resolve => { release = resolve; });
   const off = f.commands().register(createNativeLaunchCommand({ lifetimeSignal: lifetime.signal, getController: async () => { await ready; return { openBrowser() { opened++; } }; } }));
@@ -86,7 +87,7 @@ test('卸载信号在异步控制器等待后仍拦截打开，真实 SDK 记录
   assert.equal(opened, 0); assert.equal(f.events.at(-1).data.kind, 'error');
 });
 
-test('已存在自主观看时使用入口实际返回文案，不假称暂停了自主播放', async t => {
+nativeTest('已存在自主观看时使用入口实际返回文案，不假称暂停了自主播放', async t => {
   const f = await fixture(t);
   const off = f.commands().register(createNativeLaunchCommand({ getController: async () => ({ openBrowser: async () => ({ opened: true, mode: 'watch', paused: null, watchPreserved: true, sessionChanged: false, message: '合成自主窗口已显示，播放和轮次保持原状。' }) }) }));
   t.after(off);
@@ -94,7 +95,7 @@ test('已存在自主观看时使用入口实际返回文案，不假称暂停�
   assert.equal(result.result.kind, 'success'); assert.match(result.result.text, /保持原状/); assert.doesNotMatch(result.result.text, /保持暂停/);
 });
 
-test('无 commands 服务也能加载完整32工具，可选依赖挂载、卸载和恢复均独立', async t => {
+nativeTest('无 commands 服务也能加载完整32工具，可选依赖挂载、卸载和恢复均独立', async t => {
   const f = await fixture(t, { commands: false });
   const fiber = f.ctx.plugin(plugin); await fiber.await();
   assert.equal(f.tools.schemas().length, TOOL_DEFINITIONS.length); assert.equal(TOOL_DEFINITIONS.length, TOOL_DEFINITIONS.length);
@@ -109,7 +110,7 @@ test('无 commands 服务也能加载完整32工具，可选依赖挂载、卸�
   assert.equal(f.tools.schemas().length, 0); assert.equal(f.commands().list(f.agent).length, 0);
 });
 
-test('真实 SDK 热加载两次均释放命令和工具，不留下重复注册', async t => {
+nativeTest('真实 SDK 热加载两次均释放命令和工具，不留下重复注册', async t => {
   const f = await fixture(t);
   for (let index = 0; index < 2; index++) {
     const fiber = f.ctx.plugin(plugin); await fiber.await();
@@ -120,7 +121,7 @@ test('真实 SDK 热加载两次均释放命令和工具，不留下重复注册
   }
 });
 
-test('命令注册冲突会让加载失败并回收已注册工具，保留原命令', async t => {
+nativeTest('命令注册冲突会让加载失败并回收已注册工具，保留原命令', async t => {
   const f = await fixture(t);
   const original = f.commands().register({ name: 'douyin-open', description: '已有合成命令', handler: () => ({ kind: 'success', text: '保留原命令' }) });
   t.after(original);

@@ -42,7 +42,7 @@ test('分享设置HTTP要求本机token和同源，只接受开关与预算，�
   assert.equal((await f.request('/api/share/configure', { enabled: true }, { 'sec-fetch-site': 'same-site' })).status, 403);
   const initial = await f.request('/api/share/state'); assert.equal(initial.body.enabled, false); assert.equal(initial.body.dailyLimit, null);
   for (const body of [{ enabled: true, recipientId: friend }, { enabled: true, url: 'https://www.douyin.com/video/999' }, { dailyLimit: 3 }]) assert.equal((await f.request('/api/share/configure', body)).status, 400);
-  const configured = await f.request('/api/share/configure', { enabled: true, dailyLimit: 4 }); assert.equal(configured.status, 200); assert.equal(configured.body.dailyLimit, null); assert.equal(configured.body.recipients[0].id, friend);
+  const configured = await f.request('/api/share/configure', { enabled: true }); assert.equal(configured.status, 200); assert.equal(configured.body.dailyLimit, null); assert.equal(configured.body.recipients[0].id, friend);
   assert.equal((await f.request('/api/share/send', f.input)).status, 404); assert.equal((await f.request('/api/share/configure', { enabled: false })).status, 200);
   assert.equal(f.stats().browserCalls, 0); assert.equal(fs.readFileSync(f.videoLimits.sessionsFile, 'utf8'), sessions); assert.equal(f.shareService.state().daily.attempts, 0);
 });

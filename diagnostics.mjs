@@ -7,7 +7,8 @@ import { resolveRuntimePaths, resolveNodeExecutable } from './runtime-paths.mjs'
 import { probeEdgeInstallation, sanitizeBrowserFailure } from './browser-host.mjs';
 
 const execute = promisify(execFile);
-const VERSION = '1.4.7';
+// 版本号直接读 package.json，避免发布或本地更新后自检报告与实际包版本不一致。
+const VERSION = JSON.parse(fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version;
 const REPAIR = 'reapply_silent';
 const resolution = (kind, steps = [], action) => ({ kind, steps, ...(action ? { action } : {}) });
 const automatic = () => resolution('automatic', ['重新连接已核对归属的现有专用浏览器，重新应用已开启的静默设置，再回读窗口和媒体状态。'], REPAIR);

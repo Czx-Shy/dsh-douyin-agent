@@ -54,9 +54,9 @@ test('专用评论模型也占请求预算，额度不足时不生成、不发�
   assert.equal(f.watch.state().status, 'limited'); assert.equal(f.watch.state().counts.requests, 1); assert.equal(f.counts().generated, 0); assert.equal(f.posts.length, 0); assert.equal(f.videoLimits.state().daily.remainingRequests,0);
 });
 
-test('未确认公开评论立即停止watch并保留核对状态，没有第二条自动评论', async t => {
+test('未确认公开评论继续观看并进入延迟复核，不立即暂停', async t => {
   const f = fixture(t, { post: async (input, { authorize }) => { authorize({ phase: 'before-click', videoId: input.expectedVideoId }); return { confirmed: false, deliveryUncertain: true }; } }); f.commentService.configure({ enabled: true }, { explicit: true }); f.watch.start({ startSession: true, maxRequests: 4 }, { explicit: true }); await f.watch.completion;
-  assert.equal(f.watch.state().status, 'needs_user'); assert.equal(f.watch.state().counts.requests, 2); assert.equal(f.commentService.state().paused, true); assert.equal(f.commentService.state().daily.attempts, 1); assert.equal(f.counts().decisions, 1);
+  assert.equal(f.watch.state().status, 'stopped'); assert.equal(f.watch.state().counts.requests, 3); assert.equal(f.commentService.state().paused, false); assert.equal(f.commentService.state().pendingRecheck, 1); assert.equal(f.commentService.state().daily.attempts, 1); assert.equal(f.counts().decisions, 2); assert.equal(f.events.some(event => event.type === 'watch.comment-pending-recheck'), true);
 });
 
 test('生成期间用户关闭许可或停止watch，返回的文本不会发布', async t => {

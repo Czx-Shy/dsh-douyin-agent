@@ -12,17 +12,17 @@ let browser;
 before(async () => { browser = await chromium.launch({ channel: 'msedge', headless: true }); });
 after(async () => { await browser?.close(); });
 const text = '合成画面的配色很舒服。';
-async function fixture(t, { result = { id: '90001', mine: true, status: 'sent', videoId: '12345' }, existing = [], draft = '', missingInput = false, doubleButton = false } = {}) {
+async function fixture(t, { url = 'https://www.douyin.com/video/12345', result = { id: '90001', mine: true, status: 'sent', videoId: '12345' }, existing = [], draft = '', missingInput = false, doubleButton = false } = {}) {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-comment-browser-')), page = await browser.newPage();
   await page.route('**/*', route => route.fulfill({ contentType: 'text/html', body: '<!doctype html><body></body>' }));
-  await page.goto('https://www.douyin.com/video/12345');
+  await page.goto(url);
   await page.setContent('<div class="tab-user_self" data-fixture-default-self="true"><a href="https://www.douyin.com/user/synthetic-self-profile">我的</a></div><section data-e2e="feed-active-video"><video></video></section><div class="comment-mainContent" data-video-id="12345"><div data-e2e="comment-list"></div></div>' + (missingInput ? '' : '<div class="comment-input-container"><div contenteditable="true" role="textbox" style="min-height:35px;width:260px"></div><button data-e2e="comment-post">发布</button>' + (doubleButton ? '<button data-e2e="comment-submit">发布</button>' : '') + '</div>'));
-  await page.evaluate(({ result, existing }) => {
-    window.commentClicks = 0; window.result = result; window.fixtureState = { loginRequired: false, verificationRequired: false, privateChatVisible: false, video: { id: '12345', url: 'https://www.douyin.com/video/12345', readyState: 4 } };
-    window.appendComment = entry => { const row = document.createElement('div'); row.setAttribute('data-e2e', 'comment-item'); row.setAttribute('data-comment-id', entry.id); row.setAttribute('data-video-id', entry.videoId || '12345'); if (entry.mine !== undefined) row.setAttribute('data-is-self', String(entry.mine)); if (entry.status) row.setAttribute('data-send-status', entry.status); const content = document.createElement('span'); content.setAttribute('data-e2e', 'comment-content'); content.textContent = entry.text || ''; row.append(content); document.querySelector('[data-e2e="comment-list"]').append(row); };
+  await page.evaluate(({ result, existing, url }) => {
+    window.commentClicks = 0; window.result = result; window.fixtureState = { loginRequired: false, verificationRequired: false, privateChatVisible: false, video: { id: '12345', url, readyState: 4 } };
+    window.appendComment = entry => { const row = document.createElement('div'); row.setAttribute('data-e2e', 'comment-item'); row.setAttribute('data-comment-id', entry.id); row.setAttribute('data-video-id', entry.videoId || '12345'); if (entry.mine !== undefined) row.setAttribute('data-is-self', String(entry.mine)); if (entry.status) row.setAttribute('data-send-status', entry.status); const content = document.createElement('span'); content.setAttribute('data-e2e', 'comment-content'); content.textContent = entry.text || ''; row.append(content); const parent = entry.parentId ? document.querySelector(`[data-comment-id="${entry.parentId}"]`) : null; (parent || document.querySelector('[data-e2e="comment-list"]')).append(row); };
     for (const entry of existing) window.appendComment(entry);
-    document.querySelector('[data-e2e="comment-post"]')?.addEventListener('click', () => { window.commentClicks++; const editor = document.querySelector('[contenteditable]'), content = editor.innerText; if (window.result) { const rows = Array.isArray(window.result) ? window.result : [window.result]; for (const row of rows) window.appendComment({ ...row, text: row.text ?? content }); editor.textContent = ''; } });
-  }, { result, existing });
+    document.querySelector('[data-e2e="comment-post"]')?.addEventListener('click', () => { window.commentClicks++; const editor = document.querySelector('[contenteditable]'), content = editor.innerText; if (window.result) { const rows = Array.isArray(window.result) ? window.result : [window.result]; for (const row of rows) window.appendComment({ ...row, parentId: window.replyParentId, text: row.text ?? content }); editor.textContent = ''; } });
+  }, { result, existing, url });
   if (draft && !missingInput) await page.locator('[contenteditable]').fill(draft);
   const evaluate = page.evaluate.bind(page); page.evaluate = (fn, args) => fn === readPageState ? evaluate(() => window.fixtureState) : evaluate(fn, args);
   let allowed = true, lease = false, begins = 0; const phases = [], hooks = {};
@@ -223,6 +223,135 @@ test('最终输入期间用户取消后不再次点击，没有回读则保留�
   const f = await fixture(t, { result: null }), abort = new AbortController(); await f.page.exposeFunction('fixtureAbortComment', () => abort.abort(new Error('合成用户取消'))); await f.page.evaluate(() => document.querySelector('[data-e2e="comment-post"]').addEventListener('click', () => window.fixtureAbortComment()));
   const result = await f.post({ signal: abort.signal }); assert.equal(result.confirmed, false); assert.equal(result.deliveryUncertain, true); assert.equal(await f.page.evaluate(() => window.commentClicks), 1); assert.equal(await f.page.locator('[contenteditable]').innerText(), text); assert.equal(f.commenter.receipts().operations[0].status, 'uncertain');
 });
+test('主页弹层 modal_id 地址按当前作品发布评论', async t => {
+  const f = await fixture(t, { url: 'https://www.douyin.com/user/synthetic-author?modal_id=12345' }), result = await f.post();
+  assert.equal(result.confirmed, true); assert.equal(result.videoId, '12345'); assert.equal(await f.page.evaluate(() => window.commentClicks), 1);
+});
+test('主页弹层属于其他作品时仍拒绝发布', async t => {
+  const f = await fixture(t, { url: 'https://www.douyin.com/user/synthetic-author?modal_id=67890' }), result = await f.post();
+  assert.equal(result.confirmed, false); assert.equal(result.deliveryUncertain, false); assert.equal(await f.page.evaluate(() => window.commentClicks), 0);
+});
+test('回复模式只点击指定评论的回复入口，并在发布后确认新评论', async t => {
+  const f = await fixture(t, { result: { id: '90003', mine: true, status: 'sent', videoId: '12345' }, existing: [
+    { id: '90001', mine: false, status: 'sent', text: '第一条评论' },
+    { id: '90002', mine: false, status: 'sent', text: '第二条评论' },
+  ] });
+  await f.page.evaluate(() => {
+    window.replyClicks = [];
+    [...document.querySelectorAll('[data-e2e="comment-item"]')].forEach((row, index) => {
+      const reply = document.createElement('span'); reply.textContent = '回复';
+      reply.style.cssText = 'display:inline-block;cursor:pointer;width:40px;height:20px';
+      reply.addEventListener('click', () => {
+        window.replyClicks.push(index + 1);
+        window.replyParentId = row.getAttribute('data-comment-id');
+        const target = document.createElement('span'); target.setAttribute('data-e2e', 'comment-reply-target'); target.setAttribute('data-comment-id', window.replyParentId); target.textContent = row.querySelector('[data-e2e="comment-content"]')?.textContent || ''; document.querySelector('.comment-input-container').append(target);
+        const editor = document.querySelector('[contenteditable]');
+        editor.setAttribute('aria-label', `回复 @合成用户${index + 1}`); editor.focus();
+      });
+      row.append(reply);
+    });
+  });
+  const result = await f.commenter.post({ expectedVideoId: '12345', text, replyToIndex: 2, replyToCommentId: '90002', replyToText: '第二条评论' }, { authorize: f.authorize });
+  assert.equal(result.confirmed, true, JSON.stringify(result)); assert.deepEqual(await f.page.evaluate(() => window.replyClicks), [2]);
+});
+test('回复序号只按顶层评论计数，楼中楼展开不影响目标', async t => {
+  const f = await fixture(t, { result: { id: '90003', mine: true, status: 'sent', videoId: '12345' }, existing: [
+    { id: '90001', mine: false, status: 'sent', text: '第一条评论' },
+    { id: '90002', mine: false, status: 'sent', text: '第二条评论' },
+  ] });
+  await f.page.evaluate(() => {
+    window.replyTargets = [];
+    const rows = [...document.querySelectorAll('[data-e2e="comment-item"]')];
+    const nested = document.createElement('div');
+    nested.setAttribute('data-e2e', 'comment-item');
+    nested.setAttribute('data-comment-id', '90004');
+    nested.setAttribute('data-video-id', '12345');
+    nested.setAttribute('data-is-self', 'false');
+    nested.setAttribute('data-send-status', 'sent');
+    nested.style.cssText = 'display:block;width:200px;height:30px';
+    const nestedBody = document.createElement('span');
+    nestedBody.setAttribute('data-e2e', 'comment-content');
+    nestedBody.textContent = '楼中楼回复';
+    nested.append(nestedBody);
+    rows[0].append(nested);
+    const tops = [...document.querySelectorAll('[data-e2e="comment-item"]')].filter(row => !row.parentElement?.closest('[data-e2e="comment-item"]'));
+    tops.forEach((row, index) => {
+      const reply = document.createElement('span');
+      reply.textContent = '回复';
+      reply.style.cssText = 'display:inline-block;cursor:pointer;width:40px;height:20px';
+      reply.addEventListener('click', () => {
+        window.replyTargets.push({ index: index + 1, text: row.querySelector('[data-e2e="comment-content"]')?.textContent || '' });
+        window.replyParentId = row.getAttribute('data-comment-id');
+        const target = document.createElement('span'); target.setAttribute('data-e2e', 'comment-reply-target'); target.setAttribute('data-comment-id', window.replyParentId); target.textContent = row.querySelector('[data-e2e="comment-content"]')?.textContent || ''; document.querySelector('.comment-input-container').append(target);
+        const editor = document.querySelector('[contenteditable]');
+        editor.setAttribute('aria-label', `回复 @合成用户${index + 1}`);
+        editor.focus();
+      });
+      row.append(reply);
+    });
+  });
+  const result = await f.commenter.post({ expectedVideoId: '12345', text, replyToIndex: 2, replyToCommentId: '90002', replyToText: '第二条评论' }, { authorize: f.authorize });
+  assert.equal(result.confirmed, true, JSON.stringify(result));
+  // 楼中楼占了一行，但序号仍指向第二条顶层评论。
+  assert.deepEqual(await f.page.evaluate(() => window.replyTargets), [{ index: 2, text: '第二条评论' }]);
+});
+test('没有回复序号时，输入框处于回复状态仍拒绝改发新评论', async t => {
+  const f = await fixture(t, { existing: [{ id: '90001', mine: false, status: 'sent', text: '原评论' }] });
+  await f.page.evaluate(() => document.querySelector('[contenteditable]').setAttribute('aria-label', '回复 @合成用户'));
+  const result = await f.post();
+  assert.equal(result.confirmed, false); assert.equal(result.reason, '当前输入框处于回复他人的状态，未改发回复或@。'); assert.equal(await f.page.evaluate(() => window.commentClicks), 0);
+});
+test('回复态只靠“回复@昵称”占位符识别时仍可发布并确认', async t => {
+  const f = await fixture(t, { result: { id: '90003', mine: true, status: 'sent', videoId: '12345' }, existing: [
+    { id: '90001', mine: false, status: 'sent', text: '第一条评论' },
+    { id: '90002', mine: false, status: 'sent', text: '第二条评论' },
+  ] });
+  await f.page.evaluate(() => {
+    window.replyClicks = [];
+    [...document.querySelectorAll('[data-e2e="comment-item"]')].forEach((row, index) => {
+      const reply = document.createElement('span'); reply.textContent = '回复';
+      reply.style.cssText = 'display:inline-block;cursor:pointer;width:40px;height:20px';
+      reply.addEventListener('click', () => {
+        window.replyClicks.push(index + 1); window.replyParentId = row.getAttribute('data-comment-id');
+        const placeholder = document.createElement('div'); placeholder.className = 'public-DraftEditorPlaceholder-inner'; placeholder.textContent = `回复@合成用户${index + 1}`;
+        document.querySelector('.comment-input-container').prepend(placeholder);
+        const editor = document.querySelector('[contenteditable]');
+        editor.addEventListener('input', () => placeholder.remove(), { once: true });
+        editor.focus();
+      });
+      row.append(reply);
+    });
+  });
+  const result = await f.commenter.post({ expectedVideoId: '12345', text, replyToIndex: 2, replyToCommentId: '90002', replyToText: '第二条评论' }, { authorize: f.authorize });
+  assert.equal(result.confirmed, true, JSON.stringify(result)); assert.deepEqual(await f.page.evaluate(() => window.replyClicks), [2]);
+});
+test('回复框预填@昵称时允许平台提及前缀并正确确认', async t => {
+  const mention = '@合成用户2 ';
+  const f = await fixture(t, { result: { id: '90003', mine: true, status: 'sent', videoId: '12345', text: mention + text }, existing: [
+    { id: '90001', mine: false, status: 'sent', text: '第一条评论' },
+    { id: '90002', mine: false, status: 'sent', text: '第二条评论' },
+  ] });
+  await f.page.evaluate((mention) => {
+    window.replyClicks = [];
+    [...document.querySelectorAll('[data-e2e="comment-item"]')].forEach((row, index) => {
+      const reply = document.createElement('span'); reply.textContent = '回复';
+      reply.style.cssText = 'display:inline-block;cursor:pointer;width:40px;height:20px';
+      reply.addEventListener('click', () => {
+        window.replyClicks.push(index + 1); window.replyParentId = row.getAttribute('data-comment-id');
+        const editor = document.querySelector('[contenteditable]'); editor.textContent = mention; editor.focus();
+      });
+      row.append(reply);
+    });
+  }, mention);
+  const result = await f.commenter.post({ expectedVideoId: '12345', text, replyToIndex: 2, replyToCommentId: '90002', replyToText: '第二条评论' }, { authorize: f.authorize });
+  assert.equal(result.confirmed, true, JSON.stringify(result)); assert.deepEqual(await f.page.evaluate(() => window.replyClicks), [2]);
+});
+test('没有回复序号时，仅占位符显示回复态也拒绝改发新评论', async t => {
+  const f = await fixture(t, { existing: [{ id: '90001', mine: false, status: 'sent', text: '原评论' }] });
+  await f.page.evaluate(() => { const placeholder = document.createElement('div'); placeholder.className = 'public-DraftEditorPlaceholder-inner'; placeholder.textContent = '回复@合成用户'; document.querySelector('.comment-input-container').prepend(placeholder); });
+  const result = await f.post();
+  assert.equal(result.confirmed, false); assert.equal(result.reason, '当前输入框处于回复他人的状态，未改发回复或@。'); assert.equal(await f.page.evaluate(() => window.commentClicks), 0);
+});
 test('只读评论字段不含账号、昵称或头像，明确限定作品', async t => {
   const f = await fixture(t, { existing: [{ id: '90000', mine: true, status: 'sent', text: '合成已有评论' }] }); await f.page.evaluate(() => { const row = document.querySelector('[data-e2e="comment-item"]'); row.insertAdjacentHTML('beforeend', '<a href="/user/synthetic-private-account">合成评论者姓名</a><img src="https://synthetic.invalid/avatar-private">'); });
   const snapshot = await f.page.evaluate(readCommentDom, '12345'); assert.deepEqual(Object.keys(snapshot.rows[0]).sort(), ['commentId', 'videoId', 'text', 'mine', 'sent', 'pending', 'failed'].sort()); assert.equal(JSON.stringify(snapshot).includes('private'), false); assert.equal(JSON.stringify(snapshot).includes('姓名'), false);
@@ -261,12 +390,46 @@ test('作者匹配仍须绑定同作品，页面视频编号冲突则不返回�
   await f.page.evaluate(() => { const player = document.createElement('div'); player.setAttribute('data-e2e', 'player-container'); player.className = 'video_67890'; player.innerHTML = '<video style="width:300px;height:180px"></video>'; document.body.prepend(player); });
   assert.equal((await f.page.evaluate(readCommentDom, '12345')).rows.length, 0);
 });
+test('推荐流用 feed-active-video 绑定当前作品后仍能确认本人评论', async t => {
+  const f = await fixture(t, { url: 'https://www.douyin.com/?recommend=1', existing: [{ id: '90000', mine: true, status: 'sent', text: '合成已有评论' }] });
+  await f.page.evaluate(() => {
+    document.querySelector('.comment-mainContent').removeAttribute('data-video-id');
+    for (const row of document.querySelectorAll('[data-e2e="comment-item"]')) row.removeAttribute('data-video-id');
+  });
+  assert.equal((await f.page.evaluate(readCommentDom, '12345')).rows[0].mine, false);
+  await f.page.evaluate(() => {
+    const feed = document.querySelector('[data-e2e="feed-active-video"]');
+    feed.className = 'video_12345'; feed.style.cssText = 'width:300px;height:180px';
+    feed.querySelector('video').style.cssText = 'width:300px;height:180px';
+  });
+  const snapshot = await f.page.evaluate(readCommentDom, { expectedVideoId: '12345', ownProfileId: 'synthetic-self-profile' });
+  assert.equal(snapshot.rows.length, 1); assert.equal(snapshot.rows[0].mine, true); assert.equal(snapshot.rows[0].sent, true);
+});
+test('只读复核按基线编号确认新评论，且不会把旧评论当新发布', async t => {
+  const f = await fixture(t, { existing: [{ id: '90001', mine: true, status: 'sent', text: '合成已有评论' }] });
+  assert.deepEqual(await f.commenter.verifyPublished({ expectedVideoId: '12345', text: '合成已有评论', knownIds: ['89999'] }), { found: true, commentId: '90001' });
+  assert.deepEqual(await f.commenter.verifyPublished({ expectedVideoId: '12345', text: '合成已有评论', knownIds: ['90001'] }), { found: false, ambiguous: false, reason: '暂未读到新评论。' });
+  assert.deepEqual(await f.commenter.verifyPublished({ expectedVideoId: '67890', text: '合成已有评论' }), { found: false, unavailable: true, reason: '当前页面不在目标作品，稍后再复核。' });
+});
+test('人工核对未发送后解除同作品收据阻止，已确认核对继续阻止', async t => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-comment-receipts-'));
+  t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(stateDir, 'comment-browser-receipts.json'), JSON.stringify({ version: 1, operations: [{ operationId: 'op-1', videoId: '12345', startedAt: new Date().toISOString(), status: 'uncertain' }, { operationId: 'op-2', videoId: '67890', startedAt: new Date().toISOString(), status: 'confirmed' }] }));
+  const controller = { withPage: async () => { throw new Error('不应访问页面'); }, close: async () => {} };
+  const instance = new CommentBrowser({ stateDir, controller, videoLimits: { state: () => ({ allowed: true }) } });
+  const authorize = async () => true; authorize.beginDispatch = () => () => {};
+  const blocked = await instance.post({ expectedVideoId: '12345', text: '合成画面的配色很舒服。' }, { authorize }); assert.equal(blocked.confirmed, false); assert.match(blocked.reason, /收据/);
+  assert.deepEqual(instance.markResolved({ videoId: '12345', operationId: 'op-1', outcome: 'not-sent' }), { updated: 1, status: 'resolved-not-sent' });
+  const retried = await instance.post({ expectedVideoId: '12345', text: '合成画面的配色很舒服。' }, { authorize }); assert.equal(retried.confirmed, false); assert.match(retried.reason, /不应访问页面/);
+  assert.throws(() => instance.markResolved({ videoId: '67890', outcome: 'not-sent' }), /已确认/);
+  assert.equal(instance.receipts().operations.find(item => item.operationId === 'op-2').status, 'confirmed');
+});
 test('真实样式的审核或失败标签不被当成已发布', async t => {
   for (const statusLabel of ['审核中', '审核未通过']) {
     const f = await fixture(t); await nativeCommentRows(f, { statusLabel }); const row = (await f.page.evaluate(readCommentDom, '12345')).rows[0]; assert.equal(row.mine, true); assert.equal(row.sent, false); assert.equal(row.pending || row.failed, true);
   }
 });
-test('真实合成发布链路跨入口撤回许可，服务保留扣费与草稿但不发布', async t => {
+test('真实合成发布链路跨入口撤回许可，服务退回扣费并保留草稿但不发布', async t => {
   const f = await fixture(t), now = Date.now(), evidenceId = `video:${'a'.repeat(64)}`, watchRunId = 'synthetic-comment-watch';
   const personaMemory = { snapshot: () => ({ recentObservations: [{ id: evidenceId, videoId: '12345', url: 'https://www.douyin.com/video/12345', sources: ['api'], privacy: 'internal-reference', visibility: 'account-visible-unverified', observedAt: now }] }) };
   const videoLimits = { state: () => ({ allowed: true, session: { status:'active', id: 'synthetic-session', startAt: now, expiresAt: now + 60000 } }) };
@@ -277,7 +440,7 @@ test('真实合成发布链路跨入口撤回许可，服务保留扣费与草�
     return f.commenter.post(input, { ...controls, authorize });
   } });
   service.configure({ enabled: true }, { explicit: true }); const result = await service.comment({ evidenceId, videoId: '12345', text }, { watchRunId });
-  assert.equal(disabled, true); assert.equal(result.confirmed, false); assert.equal(result.deliveryUncertain, false); assert.equal(await f.page.evaluate(() => window.commentClicks), 0); assert.equal(await f.page.locator('[contenteditable]').innerText(), text); assert.equal(service.ledger().operations[0].status, 'not-sent'); assert.equal(service.state().daily.attempts, 1); await service.close(); await foreign.close();
+  assert.equal(disabled, true); assert.equal(result.confirmed, false); assert.equal(result.deliveryUncertain, false); assert.equal(await f.page.evaluate(() => window.commentClicks), 0); assert.equal(await f.page.locator('[contenteditable]').innerText(), text); assert.equal(service.ledger().operations[0].status, 'not-sent'); assert.equal(service.state().daily.attempts, 0); await service.close(); await foreign.close();
 });
 
 test('inner-only真实结构不依赖旧outer类，懒占位激活后保留签名核对并只发布一次', async t => {

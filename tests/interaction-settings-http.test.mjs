@@ -58,15 +58,16 @@ test('评论HTTP仅允许显式总开关和有限预算，不接受正文、作�
   assert.equal(f.commentService.state().daily.attempts, 0); assert.equal(fs.readFileSync(f.videoLimits.sessionsFile, 'utf8'), sessions); assert.equal(f.stats().browserCalls, 0);
 });
 
-test('评论核对HTTP保留扣过的额度与作品去重，不把未确认当成功或自动重发', async t => {
+test('评论核对未确认前阻止重复发布，确认未发送后退回额度并允许同作品重试', async t => {
   const f = await fixture(t, { post: async (input, { authorize }) => { authorize({ phase: 'before-click', videoId: input.expectedVideoId }); return { confirmed: false, deliveryUncertain: true }; } });
-  await f.request('/api/comments/configure', { enabled: true }); const result = await f.commentService.comment(f.input, { watchRunId: f.runId });
-  const current = await f.request('/api/comments/state'); assert.equal(current.body.paused, true); assert.equal(current.body.needsReview[0].operationId, result.operationId);
+  await f.request('/api/comments/configure', { enabled: true, perSessionLimit: 3 }); const result = await f.commentService.comment(f.input, { watchRunId: f.runId });
+  const current = await f.request('/api/comments/state'); assert.equal(current.body.paused, false); assert.equal(current.body.pendingRecheck, 1); assert.equal(current.body.needsReview[0].operationId, result.operationId);
+  await assert.rejects(f.commentService.comment(f.input, { watchRunId: f.runId }), /重复/);
   assert.equal((await f.request('/api/comments/resolve', { operationId: result.operationId, outcome: 'reset-budget' })).status, 400);
   assert.equal((await f.request('/api/comments/resolve', { operationId: result.operationId, outcome: 'not-sent', enabled: true })).status, 400);
   await f.request('/api/comments/configure', { enabled: false });
-  const resolved = await f.request('/api/comments/resolve', { operationId: result.operationId, outcome: 'not-sent' }); assert.equal(resolved.status, 200); assert.equal(resolved.body.paused, false); assert.equal(resolved.body.enabled, false); assert.equal(resolved.body.daily.attempts, 1);
-  await f.request('/api/comments/configure', { enabled: true }); await assert.rejects(f.commentService.comment(f.input, { watchRunId: f.runId }), /重复|次数/); assert.equal(f.stats().browserCalls, 0);
+  const resolved = await f.request('/api/comments/resolve', { operationId: result.operationId, outcome: 'not-sent' }); assert.equal(resolved.status, 200); assert.equal(resolved.body.paused, false); assert.equal(resolved.body.enabled, false); assert.equal(resolved.body.daily.attempts, 0);
+  await f.request('/api/comments/configure', { enabled: true }); const retried = await f.commentService.comment(f.input, { watchRunId: f.runId }); assert.equal(retried.deliveryUncertain, true); assert.equal(f.stats().browserCalls, 0);
 });
 
 test('日报HTTP只生成今天的真实本地证据，可回读且拒绝任意日期、路径与正文写入', async t => {
@@ -105,9 +106,9 @@ test('进程内更换API同步专用评论模型，活动发布期间禁止切�
   assert.equal(f.config.apiKey, 'synthetic-replacement-key'); assert.equal((await f.request('/api/comments/state')).status, 200);
 });
 
-test('关闭HTTP会取消自身未发布评论并等待锁释放，不遗留发送事务', async t => {
+test('关闭HTTP会取消自身未发布评论并等待锁释放，不遗留发送事务也不扣额度', async t => {
   const entered = Promise.withResolvers();
   const f = await fixture(t, { post: async (input, { signal, authorize }) => { authorize({ phase: 'prepare', videoId: input.expectedVideoId }); entered.resolve(); await new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true })); } });
   await f.request('/api/comments/configure', { enabled: true }); const pending = f.commentService.comment(f.input, { watchRunId: f.runId }); const rejected = assert.rejects(pending, /关闭/); await entered.promise;
-  await f.server.stop(); await rejected; assert.equal(f.commentService.active, null); assert.equal(fs.existsSync(f.commentService.files.send), false); assert.equal(f.commentService.state().daily.attempts, 1); assert.equal(f.stats().closed, 1);
+  await f.server.stop(); await rejected; assert.equal(f.commentService.active, null); assert.equal(fs.existsSync(f.commentService.files.send), false); assert.equal(f.commentService.state().daily.attempts, 0); assert.equal(f.stats().closed, 1);
 });

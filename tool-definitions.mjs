@@ -10,12 +10,12 @@ export const TOOL_DEFINITIONS = [
   },
   {
     name: 'douyin_open_video',
-    description: '打开刚刚读取的搜索结果，或用户提供的抖音公开视频链接。index 与 url 至少提供一个。',
+    description: '打开刚刚读取的搜索结果，或用户提供的抖音公开视频、图文链接。index 与 url 至少提供一个。',
     parameters: {
       type: 'object',
       properties: {
         index: { type: 'integer', minimum: 0, description: '已读取搜索结果中的 index。' },
-        url: { type: 'string', description: 'https://www.douyin.com/video/作品ID 公开链接。' },
+        url: { type: 'string', description: 'https://www.douyin.com/video/作品ID 或 https://www.douyin.com/note/作品ID 公开链接。' },
       },
       additionalProperties: false,
     },
@@ -23,6 +23,7 @@ export const TOOL_DEFINITIONS = [
   { name: 'douyin_next', description: '切换到下一条抖音视频，并返回切换后的状态。', parameters: empty() },
   { name: 'douyin_previous', description: '切换到上一条抖音视频，并返回切换后的状态。', parameters: empty() },
   { name: 'douyin_status', description: '读取抖音当前页面、可见文字与播放状态。文字不能代替视频画面内容。', parameters: empty() },
+  { name: 'douyin_read_comments', description: '读取当前作品可见的评论正文；主页作品弹层会自动展开评论面板。只读，不发布评论。', parameters: empty() },
   {
     name: 'douyin_observe',
     description: '观察当前视频一小段时间，采集画面和播放状态。只有支持图像输入的模型才能理解画面。',
@@ -85,6 +86,37 @@ export const TOOL_DEFINITIONS = [
   {name:'douyin_report_generate',description:'按已留存的实际视频观察与行为证据生成今日Markdown日报，不增加浏览或模型请求，不读取人格正文、私信或QQ。',parameters:empty()},
   {name:'douyin_diagnostics',description:'运行本机自检，返回错误码、处理步骤、真实静默窗口状态及可修复动作。设置页通信失败时也可使用。不启动观看、模型或发送。报告不含密钥、人格、联系人正文。',parameters:empty()},
   {name:'douyin_diagnostics_repair',description:'按最近五分钟内本入口自检报告执行一个已列出的修复动作，再次自检。仅可重新应用用户已开启的静默设置；不改许可、时段、Key、记忆或发送记录，不启动服务。修复不成功时停止，不循环重试。',parameters:{type:'object',properties:{reportId:{type:'string',minLength:36,maxLength:36},action:{type:'string',enum:['reapply_silent']}},required:['reportId','action'],additionalProperties:false}},
+  {
+    name:'douyin_search_user',
+    description:'在抖音网页版搜索用户，返回可见的用户列表（昵称、抖音号、粉丝数、是否已关注）。用于查找目标作者。',
+    parameters:{type:'object',properties:{query:{type:'string',minLength:1,maxLength:100,description:'要搜索的用户关键词，不能为空，最多 100 字。'}},required:['query'],additionalProperties:false},
+  },
+  {
+    name:'douyin_open_user',
+    description:'打开指定抖音用户的主页，返回用户资料和作品列表。secUid 或 url 至少提供一个。',
+    parameters:{
+      type:'object',
+      properties:{
+        secUid:{type:'string',minLength:1,maxLength:200,description:'由 douyin_search_user 返回的用户 secUid。'},
+        url:{type:'string',description:'https://www.douyin.com/user/secUid 用户主页公开链接。'},
+      },
+      additionalProperties:false,
+    },
+  },
+  {
+    name:'douyin_message_user',
+    description:'进入指定用户主页并发送一条私信。若对方设置关注后才能发消息，会自动关注后再发送。受每日主动私信上限和最小间隔限制。',
+    parameters:{
+      type:'object',
+      properties:{
+        secUid:{type:'string',minLength:1,maxLength:200,description:'由 douyin_search_user 或 douyin_open_user 返回的用户 secUid。'},
+        url:{type:'string',description:'https://www.douyin.com/user/secUid 用户主页公开链接。'},
+        message:{type:'string',minLength:1,maxLength:500,description:'要发送的私信内容，1 到 500 字。'},
+      },
+      required:['message'],
+      additionalProperties:false,
+    },
+  },
 ];
 
 // 注册前和执行前均使用同一份定义；只接受目录中声明的简单参数。
@@ -115,7 +147,16 @@ export function validateToolArguments(definition, args) {
   if (definition.name === 'douyin_open_video') {
     if (args.index === undefined && args.url === undefined) throw new TypeError('打开作品需要 index 或 url。');
     if (args.index !== undefined && args.index < 0) throw new RangeError('搜索结果 index 不能为负数。');
-    if (args.url !== undefined && !/^https:\/\/(?:www\.)?douyin\.com\/video\/\d+\/?(?:\?[^#]*)?(?:#.*)?$/.test(args.url)) throw new TypeError('作品链接必须是抖音公开 video 链接。');
+    if (args.url !== undefined && !/^https:\/\/(?:www\.)?douyin\.com\/(?:video|note)\/\d+\/?(?:\?[^#]*)?(?:#.*)?$/.test(args.url)) throw new TypeError('作品链接必须是抖音公开 video 或 note 链接。');
+  }
+  if (definition.name === 'douyin_open_user') {
+    if (args.secUid === undefined && args.url === undefined) throw new TypeError('打开用户主页需要 secUid 或 url。');
+    if (args.url !== undefined && !/^https:\/\/(?:www\.)?douyin\.com\/user\/[A-Za-z0-9_-]+\/?(?:\?[^#]*)?(?:#.*)?$/.test(args.url)) throw new TypeError('用户主页链接必须是 https://www.douyin.com/user/secUid。');
+  }
+  if (definition.name === 'douyin_message_user') {
+    if (args.secUid === undefined && args.url === undefined) throw new TypeError('私信用户需要 secUid 或 url。');
+    if (args.url !== undefined && !/^https:\/\/(?:www\.)?douyin\.com\/user\/[A-Za-z0-9_-]+\/?(?:\?[^#]*)?(?:#.*)?$/.test(args.url)) throw new TypeError('用户主页链接必须是 https://www.douyin.com/user/secUid。');
+    if (!args.message.trim()) throw new TypeError('私信内容不能为空。');
   }
   return args;
 }

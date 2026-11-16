@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 
 const DAY = 86_400_000;
 const SOURCES = ['api', 'dsh'];
-const READ_ACTIONS = new Set(['douyin_status', 'douyin_pause', 'douyin_recall', 'douyin_remember', 'douyin_video_limits_status']);
+const READ_ACTIONS = new Set(['douyin_status', 'douyin_pause', 'douyin_recall', 'douyin_remember', 'douyin_video_limits_status', 'douyin_search_user', 'douyin_open_user', 'douyin_read_comments']);
 export const DEFAULT_VIDEO_POLICY = Object.freeze({ version: 1, timeZone: 'Asia/Shanghai', enabled:false, windows: ['00:00-24:00'], dailyMinutes: 10, dailyRequests:30 });
 const shanghai = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' });
 const read = (file) => JSON.parse(fs.readFileSync(file, 'utf8'));

@@ -2,18 +2,21 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
-import { ApiAgent, redact, watchDecisionMessages, parseWatchDecision } from './api-agent.mjs?v=13';
+import { ApiAgent, redact, watchDecisionMessages, parseWatchDecision, parseProfileDecision } from './api-agent.mjs?v=20';
 import { resolveRuntimePaths } from './runtime-paths.mjs';
 import { AutonomousShare, isSharePreflightNotSent } from './autonomous-share.mjs?v=9';
-import { AutonomousComments } from './autonomous-comments.mjs?v=9';
-import { PublicCommentAgent } from './public-comment-agent.mjs?v=9';
+import { AutonomousComments } from './autonomous-comments.mjs?v=10';
+import { PublicCommentAgent } from './public-comment-agent.mjs?v=10';
 import { DailyReport } from './daily-report.mjs?v=9';
 
 import { WatchOptions } from './watch-options.mjs';
 import { UsageLedger } from './usage-ledger.mjs';
 import { BEHAVIOR_THRESHOLDS } from './persona-memory.mjs';
+import { COMMENT_LIST_LIMIT, validCommentId } from './comment-contract.mjs';
 
 export const WATCH_LIMITS = Object.freeze({ sampleSeconds: 3 });
+// 同一次运行内重复进入同一作者主页可连续观看的作品上限
+const PROFILE_SESSION_LIMIT = 5;
 const alive = pid => { if (!Number.isSafeInteger(pid) || pid < 1) return false; try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; } };
 const exited = pid => { if (!Number.isSafeInteger(pid) || pid < 1) return false; try { process.kill(pid, 0); return false; } catch (error) { return error.code === 'ESRCH'; } };
 const read = (file, fallback) => { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (error) { if (error.code === 'ENOENT') return fallback; throw new Error('自主观看状态文件损坏，未重置预算或运行锁。'); } };
@@ -119,7 +122,7 @@ export class AutonomousWatch {
     const request = read(this.files.stop, null), stopping = worker?.alive && request?.runId === worker.runId;
     const savedRunMatches = savedMatches && worker?.alive && Number.isFinite(worker.heartbeatAt) && this.now() - worker.heartbeatAt >= 0 && this.now() - worker.heartbeatAt < 5000;
     const ownRun = this.running && worker?.owned && worker.sessionId === this.sessionId && worker.source === this.source;
-    return redact({ protocol: 'autonomous-watch-v1', running: Boolean(worker?.alive), owned: Boolean(worker?.owned), worker, status: stopping ? 'stopping' : worker?.alive ? 'running' : ['running', 'stopping'].includes(selectedSaved.status) ? 'stopped' : selectedSaved.status || 'stopped', sessionId, counts: { ...counts, maxRequests:null, dailyRequests: time.daily?.requests ?? budget.days[day(this.now())] ?? 0, dailyLimit: time.policy.dailyRequests ?? null }, phase: ownRun ? this.phase || 'waiting' : savedRunMatches ? selectedSaved.phase || 'waiting' : 'idle', pendingRequests: ownRun ? this.pendingRequests || 0 : savedRunMatches && selectedSaved.pendingRequests === 1 ? 1 : 0, shareProgress: ownRun ? this.shareProgress || null : savedRunMatches ? readShareProgress(selectedSaved.shareProgress) : null, options: this.optionsService.state().policy, lastDecision: selectedSaved.lastDecision || null, lastError: selectedSaved.lastError || '', lastSwitchDiagnostic: readSwitchDiagnostic(selectedSaved.lastSwitchDiagnostic), remainingSeconds: time.allowed && time.session?.id === sessionId ? time.remainingSeconds : 0 }, [this.config.apiKey]);
+    return redact({ protocol: 'autonomous-watch-v1', running: Boolean(worker?.alive), owned: Boolean(worker?.owned), worker, status: stopping ? 'stopping' : worker?.alive ? 'running' : ['running', 'stopping'].includes(selectedSaved.status) ? 'stopped' : selectedSaved.status || 'stopped', sessionId, counts: { ...counts, maxRequests:null, dailyRequests: time.daily?.requests ?? budget.days[day(this.now())] ?? 0, dailyLimit: time.policy.dailyRequests ?? null }, phase: ownRun ? this.phase || 'waiting' : savedRunMatches ? selectedSaved.phase || 'waiting' : 'idle', pendingRequests: ownRun ? this.pendingRequests || 0 : savedRunMatches && selectedSaved.pendingRequests === 1 ? 1 : 0, shareProgress: ownRun ? this.shareProgress || null : savedRunMatches ? readShareProgress(selectedSaved.shareProgress) : null, options: this.optionsService.state().policy, lastDecision: selectedSaved.lastDecision || null, lastProfileDecision: selectedSaved.lastProfileDecision || null, lastError: selectedSaved.lastError || '', lastSwitchDiagnostic: readSwitchDiagnostic(selectedSaved.lastSwitchDiagnostic), remainingSeconds: time.allowed && time.session?.id === sessionId ? time.remainingSeconds : 0 }, [this.config.apiKey]);
   }
   save(value) { write(this.files.state, redact({ ...read(this.files.state, {}), ...value, source: this.source, sessionId: this.sessionId, runId:this.runId, updatedAt: new Date(this.now()).toISOString() }, [this.config.apiKey])); }
   assertAllowed() {
@@ -169,7 +172,7 @@ export class AutonomousWatch {
     });
     this.abort = new AbortController(); this.running = true; this.playbackClosed=false;this.phase='waiting';this.pendingRequests=0;this.startedDate = day(this.now());
     try {
-    this.save({ status: 'running', phase:'waiting',pendingRequests:0,lastError: '', lastDecision: null });
+    this.save({ status: 'running', phase:'waiting',pendingRequests:0,lastError: '', lastDecision: null, lastProfileDecision: null });
     this.heartbeat = setInterval(() => {
       try {
         const request = read(this.files.stop, null); if (request?.runId === this.runId) this.abort.abort(failure('用户停止自主观看。', 'stopped'));
@@ -194,11 +197,11 @@ export class AutonomousWatch {
       this.save({lastSwitchDiagnostic:switchFailureDiagnostic({name,output,error,source:this.source,runId:this.runId,now:this.now(),startedAt,expectedVideoId,stage})});
     } catch { try { this.onEvent({type:'watch.diagnostic_failed',message:'换片诊断未能保存。'}); } catch {} }
   }
-  async execute(name, args = {}, { expectedVideoId, expectedImageKey,advanceImage=false,expectedLiveRoomId,expectedLivePreviewKey,enterLive=false,exitLive=false, allowLoading = false } = {}) {
+  async execute(name, args = {}, { expectedVideoId, expectedImageKey,advanceImage=false,expectedLiveRoomId,expectedLivePreviewKey,enterLive=false,exitLive=false, allowLoading = false, profileWork = false } = {}) {
     this.assertAllowed();
     const startedAt = this.now();
     let output;
-    try { output = await this.controller.execute(name, args, { signal: this.abort.signal, autonomousRunId: this.runId, ...(expectedVideoId === undefined ? {} : { expectedVideoId }),...(expectedImageKey?{expectedImageKey,advanceImage}:{}),...(expectedLiveRoomId?{expectedLiveRoomId,enterLive,exitLive}:{}),...(expectedLivePreviewKey?{expectedLivePreviewKey}:{}) }); }
+    try { output = await this.controller.execute(name, args, { signal: this.abort.signal, autonomousRunId: this.runId, ...(expectedVideoId === undefined ? {} : { expectedVideoId }),...(expectedImageKey?{expectedImageKey,advanceImage}:{}),...(expectedLiveRoomId?{expectedLiveRoomId,enterLive,exitLive}:{}),...(expectedLivePreviewKey?{expectedLivePreviewKey}:{}),...(profileWork?{profileWork:true}:{}) }); }
     catch (error) { this.recordSwitchFailure(name,null,{error,startedAt,expectedVideoId}); throw error; }
     if (output?.changed !== true) this.recordSwitchFailure(name,output,{startedAt,expectedVideoId});
     this.assertAllowed();
@@ -246,6 +249,125 @@ export class AutonomousWatch {
     return this.shareService;
   }
   shareContext(videoId) { return this.getShareService()?.context({ videoId }) ?? { enabled: false, paused: false, dailyRemaining: 0, recipients: [] }; }
+  // 查看主页与私信许可由各自主服务维护，模型只看到核对后的最小上下文。
+  async profileContext() {
+    try {
+      const service = await this.controller.getProfileViewService?.();
+      const context = service?.context() ?? { enabled: false, prompt: '', remaining: 0 };
+      const state = service?.state?.() ?? {};
+      // 连续观看会话尚未结束时，即使当日额度用尽也允许再进同一作者主页（不额外扣额度）
+      if (this.profileSession && state.enabled === true && state.ledgerOk !== false) return { ...context, enabled: true, remaining: Math.max(context.remaining, 1) };
+      return context;
+    }
+    catch { return { enabled: false, prompt: '', remaining: 0 }; }
+  }
+  async dmContext() {
+    try {
+      const service = await this.controller.getOutboundMessageService?.();
+      const state = service?.state?.() ?? {};
+      const remaining = Number.isSafeInteger(state.remaining) ? state.remaining : 0;
+      return { enabled: state.enabled === true && remaining > 0, remaining, prompt: typeof state.dmPrompt === 'string' ? state.dmPrompt : '' };
+    } catch { return { enabled: false, remaining: 0, prompt: '' }; }
+  }
+  // 进入作者主页：核对许可与额度，读取主页作品列表，再由模型决定打开作品、私信或离开。
+  async visitAuthor(observedState) {
+    const service = await this.controller.getProfileViewService?.();
+    if (!service) throw Object.assign(new Error('查看主页服务未加载，未打开主页。'), { code: 'WATCH_DECISION_FORMAT' });
+    let secUid = observedState.video?.authorSecUid;
+    if (!secUid && /^\d{10,30}$/.test(observedState.video?.id || '')) {
+      // 推荐流有时读不到作者链接，先打开作品详情页拿到作者，再进主页
+      const detail = await this.execute('douyin_open_video', { url: `https://www.douyin.com/video/${observedState.video.id}` }, { allowLoading: true });
+      secUid = (detail.state || detail)?.video?.authorSecUid || null;
+    }
+    if (!secUid) throw Object.assign(new Error('当前作品没有可核对的作者主页地址，未打开主页。'), { code: 'WATCH_DECISION_FORMAT' });
+    // 同一次运行内重复进入同一作者主页不再扣额度，实现一次进主页连续看多条
+    const previousSession = this.profileSession;
+    const reuseSession = previousSession?.secUid === secUid && previousSession.count < PROFILE_SESSION_LIMIT;
+    let reservationId = null;
+    if (!reuseSession) {
+      try { reservationId = await service.reserve(this.abort.signal); }
+      catch (error) { error.code ||= 'WATCH_DECISION_FORMAT'; throw error; }
+    }
+    this.phase = 'profile'; this.save({ phase: this.phase, pendingRequests: 0 });
+    let current, state, visited = false, openFailure = null;
+    try {
+      current = await this.execute('douyin_open_user', { secUid });
+      state = current.state || current;
+      for (let attempt = 0; attempt < 12 && state.pageKind === 'user-profile' && !(state.userProfile?.works?.length); attempt++) {
+        await this.delayImpl(500, this.abort.signal); this.assertAllowed();
+        current = await this.execute('douyin_status'); state = current.state || current;
+      }
+      if (state.pageKind !== 'user-profile' || !state.userProfile || state.userProfile.secUid !== secUid) throw failure('打开作者主页后没有读到可核对的主页资料，已停止自主观看。', 'needs_user');
+      visited = true;
+    } catch (error) { openFailure = error; }
+    if (reservationId) {
+      try { await service.settle(reservationId, { visited }); }
+      catch (error) {
+        if (openFailure) { openFailure.settleError = error.message; throw openFailure; }
+        throw failure(`查看主页计数结算失败：${error.message}`, 'needs_user');
+      }
+    }
+    if (openFailure) throw openFailure;
+    const profile = state.userProfile;
+    const watched = reuseSession ? previousSession.watched : [];
+    this.profileSession = { secUid, count: (reuseSession ? previousSession.count : 0) + 1, watched: [...watched] };
+    const remainingWorks = profile.works.filter(item => !watched.includes(item.id));
+    this.onEvent({ type: 'watch.profile', secUid, nickname: profile.nickname, workCount: profile.works.length, remainingWorks: remainingWorks.length, reused: reuseSession, remaining: service.state().remaining });
+    if (!remainingWorks.length) {
+      this.profileSession = null;
+      return { current: await this.execute('douyin_open', {}, { allowLoading: true }) };
+    }
+    const dmContext = await this.dmContext();
+    this.phase = 'model'; this.pendingRequests = 1; this.save({ phase: this.phase, pendingRequests: 1 });
+    let result;
+    try { this.reserveRequest(); result = await this.agent.decideProfile({ profile: { ...profile, works: remainingWorks }, context: this.personaMemory.context(), profilePrompt: service.policy().prompt, dmContext, signal: this.abort.signal, decisionProvider: this.decisionProvider }); }
+    finally { this.pendingRequests = 0; this.phase = 'waiting'; this.save({ phase: this.phase, pendingRequests: 0 }); }
+    this.assertAllowed();
+    let decision;
+    try { decision = parseProfileDecision(result.decision, { dmContext }); }
+    catch (error) {
+      this.invalidDecisionStreak = (this.invalidDecisionStreak || 0) + 1;
+      this.onEvent({ type: 'watch.profile-decision-rejected', code: error.code || 'PROFILE_DECISION_FORMAT', consecutive: this.invalidDecisionStreak, message: '主页模型决策无效，先回到推荐流。' });
+      this.save({ lastProfileDecision: null, decisionRetry: { consecutive: this.invalidDecisionStreak, code: 'PROFILE_DECISION_FORMAT' } });
+      if (this.invalidDecisionStreak >= 3) throw failure('连续三次未取得有效观看决策，已停止本次观看；今日用量保留。');
+      return { current: await this.execute('douyin_open', {}, { allowLoading: true }) };
+    }
+    // 主页决策是第二轮判断，写入独立字段，不覆盖观看循环的 lastDecision。
+    this.invalidDecisionStreak = 0; this.save({ lastProfileDecision: decision, usage: result.usage, decisionRetry: null });
+    this.onEvent(redact({ type: 'watch.profile-decision', decision }, [this.config.apiKey]));
+    current = await this.execute('douyin_status');
+    state = current.state || current;
+    if (state.pageKind !== 'user-profile' || state.userProfile?.secUid !== secUid) { this.onEvent({ type: 'watch.decision-discarded', action: decision.action, reasonCode: 'profile-page-changed' }); return { current }; }
+    if (decision.action === 'stop') { this.profileSession = null; return { current, stopRequested: true }; }
+    if (decision.action === 'open_work') {
+      const work = (state.userProfile.works || []).find(item => item.id === decision.workId);
+      if (!work) {
+        this.invalidDecisionStreak = (this.invalidDecisionStreak || 0) + 1;
+        this.onEvent({ type: 'watch.profile-decision-rejected', code: 'PROFILE_WORK_NOT_FOUND', consecutive: this.invalidDecisionStreak, message: '模型选择的作者作品不在主页列表，先回到推荐流。' });
+        this.save({ lastProfileDecision: null, decisionRetry: { consecutive: this.invalidDecisionStreak, code: 'PROFILE_WORK_NOT_FOUND' } });
+        if (this.invalidDecisionStreak >= 3) throw failure('连续三次未取得有效观看决策，已停止本次观看；今日用量保留。');
+        return { current: await this.execute('douyin_open', {}, { allowLoading: true }) };
+      }
+      try {
+        current = await this.execute('douyin_open_video', { url: work.url }, { allowLoading: true, profileWork: true });
+      } catch (error) {
+        if (error.code !== 'PROFILE_MODAL_FAILED') throw error;
+        this.onEvent({ type: 'watch.profile-modal-fallback', workId: work.id, message: '主页作品弹层未能打开，改用作品直链。' });
+        current = await this.execute('douyin_open_video', { url: work.url }, { allowLoading: true });
+      }
+      this.profileSession.watched.push(work.id);
+      return { current };
+    }
+    if (decision.action === 'message_author') {
+      const delivery = await this.execute('douyin_message_user', { secUid, message: decision.message });
+      this.onEvent(redact({ type: 'watch.profile-message', delivery }, [this.config.apiKey]));
+      if (delivery?.deliveryUncertain) throw failure('私信发送结果未确认，请在抖音核对，已停止自主观看；不会重发。', 'needs_user');
+      if (delivery?.confirmed !== true) throw failure(delivery?.message || '没有确认私信发送成功。', 'needs_user');
+    }
+    // 模型选择离开或发完私信后结束本次连续观看，下次进主页重新计额度
+    this.profileSession = null;
+    return { current: await this.execute('douyin_open', {}, { allowLoading: true }) };
+  }
   async recoverDecision(error) {
     if (!['WATCH_DECISION_FORMAT','WATCH_DECISION_INCOMPLETE'].includes(error?.code)) throw error;
     this.invalidDecisionStreak = (this.invalidDecisionStreak || 0) + 1;
@@ -338,11 +460,11 @@ export class AutonomousWatch {
     watchDecisionMessages(observation);
     const shareContext={enabled:false,paused:false,dailyRemaining:0,recipients:[]},commentContext={enabled:false,remainingDaily:0,remainingSession:0};
     this.phase='model';this.pendingRequests=1;this.save({phase:this.phase,pendingRequests:1});let result;
-    try{this.reserveRequest();result=await this.agent.decideWatch({observation,context:this.personaMemory.context(),watchOptions:options,shareContext,commentContext,signal:this.abort.signal,decisionProvider:this.decisionProvider});}
+    try{this.reserveRequest();result=await this.agent.decideWatch({observation,context:this.personaMemory.context(),watchOptions:options,shareContext,commentContext,profileContext:{enabled:false,prompt:'',remaining:0},signal:this.abort.signal,decisionProvider:this.decisionProvider});}
     catch(error){if(!['WATCH_DECISION_FORMAT','WATCH_DECISION_INCOMPLETE'].includes(error?.code))throw error;return{current:await this.recoverDecision(error)};}
     finally{this.pendingRequests=0;this.phase='waiting';this.save({phase:this.phase,pendingRequests:0});}
     this.assertAllowed();let decision;
-    try{decision=redact(parseWatchDecision(result.decision,{shareContext,commentContext,mediaKind:'image-post'}),[this.config.apiKey]);}catch(error){return{current:await this.recoverDecision(error)};}
+    try{decision=redact(parseWatchDecision(result.decision,{shareContext,commentContext,profileContext:{enabled:false,prompt:'',remaining:0},mediaKind:'image-post'}),[this.config.apiKey]);}catch(error){return{current:await this.recoverDecision(error)};}
     this.invalidDecisionStreak=0;this.save({lastDecision:decision,usage:result.usage,decisionRetry:null});
     current=await this.execute('douyin_status');
     if(decision.action==='stop')return{current,stopRequested:true};
@@ -375,10 +497,10 @@ export class AutonomousWatch {
     if(!observation.frames?.length){this.onEvent({type:'watch.live-unavailable',roomVerified:true,reasonCode:'live-frames-unavailable'});return{current:await leave()};}
     watchDecisionMessages(observation);const shareContext={enabled:false,recipients:[]},commentContext={enabled:false};
     this.phase='model';this.pendingRequests=1;this.save({phase:this.phase,pendingRequests:1});let result;
-    try{this.reserveRequest();result=await this.agent.decideWatch({observation,context:this.personaMemory.context(),shareContext,commentContext,signal:this.abort.signal,decisionProvider:this.decisionProvider});}
+    try{this.reserveRequest();result=await this.agent.decideWatch({observation,context:this.personaMemory.context(),shareContext,commentContext,profileContext:{enabled:false,prompt:'',remaining:0},signal:this.abort.signal,decisionProvider:this.decisionProvider});}
     catch(error){if(!['WATCH_DECISION_FORMAT','WATCH_DECISION_INCOMPLETE'].includes(error?.code))throw error;return{current:await this.recoverDecision(error)};}
     finally{this.phase='waiting';this.pendingRequests=0;this.save({phase:this.phase,pendingRequests:0});}
-    this.assertAllowed();let decision;try{decision=parseWatchDecision(result.decision,{shareContext,commentContext,mediaKind:'live-room'});}catch(error){return{current:await this.recoverDecision(error)};}
+    this.assertAllowed();let decision;try{decision=parseWatchDecision(result.decision,{shareContext,commentContext,profileContext:{enabled:false,prompt:'',remaining:0},mediaKind:'live-room'});}catch(error){return{current:await this.recoverDecision(error)};}
     this.invalidDecisionStreak=0;this.save({lastDecision:decision,usage:result.usage,decisionRetry:null});current=await this.execute('douyin_status');
     if(!isLiveRoom(current.state||current)||(current.state||current).liveRoom.roomId!==roomId){this.onEvent({type:'watch.decision-discarded',action:decision.action,reasonCode:'observed-live-room-changed'});return{current};}
     if(decision.action==='stay'){await this.delayImpl(decision.seconds*1000,this.abort.signal);this.assertAllowed();current=await this.execute('douyin_status');}
@@ -387,7 +509,7 @@ export class AutonomousWatch {
   }
   async run() {
     let status = 'stopped', lastError = '';
-    this.liveSkipStreak = 0;this.invalidDecisionStreak=0;this.shareProgress=null;
+    this.liveSkipStreak = 0;this.invalidDecisionStreak=0;this.shareProgress=null;this.profileSession=null;
     try {
       this.save({shareProgress:null,decisionRetry:null});
       let current = await this.execute('douyin_status', {}, { allowLoading: true });
@@ -401,6 +523,7 @@ export class AutonomousWatch {
       current = await this.readyAtStartup(current);
       while (true) {
         this.assertAllowed();
+        try { await this.getCommentService().recheckDue?.({ signal: this.abort.signal }); } catch { /* 复核失败不阻塞观看，待复核状态保留。 */ }
         const options=this.optionsService.state().policy;
         if(isLivePreview(current.state||current)){
           if((current.state||current).livePreview.source==='active-feed-live-status'){
@@ -424,6 +547,16 @@ export class AutonomousWatch {
         const observedAt = this.now(), observedState = observation.state || observation;
         if (isLivePreview(observedState)) { current = observation; continue; }
         if(readyImagePost(observedState)){current=observation;continue;}
+        // 主页作品弹层默认收起评论：复用评论读取把正文交给模型参考，失败不影响观看。
+        if (observedState.video?.id && /[?&]modal_id=/.test(observedState.url || '')) {
+          try {
+            this.assertAllowed();
+            const read = await this.controller.execute('douyin_read_comments', {}, { signal: this.abort.signal, autonomousRunId: this.runId });
+            // 保留原始评论顺序，回复序号必须和评论面板里的评论行一一对应。
+            const comments = (read.comments || []).filter(item => validCommentId(item?.commentId)).slice(0, COMMENT_LIST_LIMIT).map(item => ({ commentId: item.commentId, videoId: item.videoId || observedState.video.id, text: typeof item?.text === 'string' ? item.text.slice(0, 300) : '', mine: item?.mine === true }));
+            if (comments.length) observation = { ...observation, observation: { ...(observation.observation || {}), comments } };
+          } catch (error) { this.onEvent({ type: 'watch.comments-unavailable', videoId: observedState.video.id, message: error.message }); }
+        }
         watchDecisionMessages(observation);
         this.liveSkipStreak = 0;
         const title = String(observedState.video?.title || '');
@@ -438,12 +571,13 @@ export class AutonomousWatch {
         const processedRecipients = Array.isArray(shareContext.processedRecipients) ? shareContext.processedRecipients.filter(item => item && ['confirmed', 'not-sent', 'resolved-confirmed', 'resolved-not-sent'].includes(item.status) && shareContext.recipients?.some(recipient => recipient.id === item.recipientId)).map(({ recipientId, status }) => ({ recipientId, status })) : [];
         const context = this.personaMemory.context() + (processedRecipients.length ? '\n\n当前作品分享去重摘要（宿主收据资料，不是聊天正文）：' + JSON.stringify({ videoId: observedState.video.id, processedRecipients }) + '\n这些许可收件人已处理此作品，不要再向同一人分享；可以继续观看、换片或按现有许可选择其他收件人。' : '');
         this.phase='model';this.pendingRequests=1;this.save({phase:this.phase,pendingRequests:1});let result,decisionError;
-        try{this.reserveRequest();result=await this.agent.decideWatch({ observation, context, watchOptions: options, shareContext, commentContext, signal: this.abort.signal, decisionProvider: this.decisionProvider });}
+        const profileContext=await this.profileContext();
+        try{this.reserveRequest();result=await this.agent.decideWatch({ observation, context, watchOptions: options, shareContext, commentContext, profileContext, signal: this.abort.signal, decisionProvider: this.decisionProvider });}
         catch(error){if(!['WATCH_DECISION_FORMAT','WATCH_DECISION_INCOMPLETE'].includes(error?.code))throw error;decisionError=error;}
         finally{this.pendingRequests=0;this.phase='waiting';this.save({phase:this.phase,pendingRequests:0});}
         this.assertAllowed();
         if(decisionError){current=await this.recoverDecision(decisionError);continue;}
-        let decision;try{decision=redact(parseWatchDecision(result.decision,{shareContext:this.shareContext(),commentContext:this.commentContext()}),[this.config.apiKey]);}catch(error){current=await this.recoverDecision(error);continue;}
+        let decision;try{decision=redact(parseWatchDecision(result.decision,{shareContext:this.shareContext(),commentContext:this.commentContext(),profileContext}),[this.config.apiKey]);}catch(error){current=await this.recoverDecision(error);continue;}
         this.invalidDecisionStreak=0;this.save({decisionRetry:null});
         current = await this.execute('douyin_status');
         if (decision.action !== 'stop') current = await this.readyAfterModel(current);
@@ -496,14 +630,21 @@ export class AutonomousWatch {
           try{this.reserveRequest();generated=await this.commentAgent.generate({ observation, signal: this.abort.signal, decisionProvider: this.decisionProvider });}
           finally{this.pendingRequests=0;this.phase='waiting';this.save({phase:this.phase,pendingRequests:0});}
           this.assertAllowed();
-          if (generated.text !== null) {
-            const delivery = await this.getCommentService().comment({ evidenceId, videoId: observedState.video.id, text: generated.text }, { signal: this.abort.signal, watchRunId: this.runId });
+          const pendingVideos = this.getCommentService().state().pendingRecheckVideos || [];
+          if (generated.text !== null && pendingVideos.includes(observedState.video.id)) {
+            this.onEvent({ type: 'watch.comment-skipped-pending-recheck', videoId: observedState.video.id, usage: generated.usage, message: '该作品评论待复核，跳过本次评论。' });
+          } else if (generated.text !== null) {
+            const delivery = await this.getCommentService().comment({ evidenceId, videoId: observedState.video.id, text: generated.text, ...(generated.replyToIndex ? { replyToIndex: generated.replyToIndex, replyToCommentId: generated.replyToCommentId, replyToText: generated.replyToText } : {}) }, { signal: this.abort.signal, watchRunId: this.runId });
             this.onEvent({ type: 'watch.comment', delivery, usage: generated.usage });
-            if (delivery?.deliveryUncertain) throw failure('评论发布结果未确认，请在抖音核对，已停止自主观看。', 'needs_user');
-            if (delivery?.confirmed !== true) throw failure(delivery?.reason || '没有确认公开评论发布成功。', 'needs_user');
+            if (delivery?.deliveryUncertain) this.onEvent({ type: 'watch.comment-pending-recheck', operationId: delivery.operationId, videoId: observedState.video.id, recheckDueAt: delivery.recheckDueAt || null, message: '评论结果进入自动复核，只暂停同作品评论，继续观看。' });
+            else if (delivery?.confirmed !== true) throw failure(delivery?.reason || '没有确认公开评论发布成功。', 'needs_user');
           }
         } else if (decision.action === 'share') {
           learned=await this.shareDecision(decision,{evidenceId,videoId:observedState.video.id});
+        } else if (decision.action === 'open_author') {
+          // 查看主页会离开当前作品，由 visitAuthor 内部完成第二轮判断后再回到观看循环。
+          try { const visited = await this.visitAuthor(observedState); current = visited.current; if (visited.stopRequested) break; continue; }
+          catch (error) { if (error?.code !== 'WATCH_DECISION_FORMAT') throw error; current = await this.recoverDecision(error); continue; }
         } else if (decision.action === 'stay') {
           const stayBefore = current, beforeState = freshState;
           if (beforeState.video?.id !== observedState.video.id || beforeState.video.paused !== false) throw failure('停留前作品或播放状态已变化，已停止自主观看，没有学习本次停留。', 'needs_user');

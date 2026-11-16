@@ -4,11 +4,13 @@ import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
+import { dshNodeModules } from './sdk.mjs';
+
 const projectDir = fileURLToPath(new URL('..', import.meta.url));
-const defaultSdk = 'F:/codex/DSH Desktop 2/resources/app/node_modules';
 
 // 只读取配置并在内存合成，不加载插件、求值表达式或改写 profile。
-export async function inspectNativeProfile({ homeDir = process.env.DSH_HOME || path.join(homedir(), '.dsh'), sdk = process.env.DSH_NODE_MODULES || defaultSdk } = {}) {
+export async function inspectNativeProfile({ homeDir = process.env.DSH_HOME || path.join(homedir(), '.dsh'), sdk = process.env.DSH_NODE_MODULES || dshNodeModules } = {}) {
+  if (!sdk) throw Object.assign(new Error('未找到 DSH 原生运行库：请设置 DSH_NODE_MODULES 后重试。'), { code: 'DSH_SDK_MISSING' });
   const { loadProfileDirectory, loadOverlayPatches, composeEntries } = await import(pathToFileURL(path.join(sdk, '@deepseek-ai/dsh-app-boot/lib/index.js')).href);
   const profileDir = path.join(homeDir, 'profiles', 'desktop');
   const profile = loadProfileDirectory('douyin-install-audit', profileDir, path.join(sdk, '@deepseek-ai/dsh/package.json'));

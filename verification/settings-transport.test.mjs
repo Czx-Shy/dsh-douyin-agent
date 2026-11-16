@@ -4,13 +4,14 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { bindNativeSettingsRoutes, createSettingsFetchHandler, createSettingsRpcHandler } from '../native-settings-transport.mjs';
 import { createNativeSettingsRoute } from '../native-settings.mjs';
+import { dshNodeModules as sdk, nativeTest } from './sdk.mjs';
 
-const sdk = process.env.DSH_NODE_MODULES || 'F:/codex/DSH Desktop 2/resources/app/node_modules';
-const [{ Context }, { WebServer }, connectionModule] = await Promise.all([
+const sdkModules = sdk ? await Promise.all([
   import(pathToFileURL(path.join(sdk, '@deepseek-ai/cordis/lib/index.js')).href),
   import(pathToFileURL(path.join(sdk, '@deepseek-ai/dsh-host-webserver/lib/index.js')).href),
   import(pathToFileURL(path.join(sdk, '@deepseek-ai/dsh-client-connection/lib/index.js')).href),
-]);
+]) : [];
+const [{ Context } = {}, { WebServer } = {}, connectionModule = {}] = sdkModules;
 
 async function fixture(t, web = true) {
   const ctx = new Context(), settings = { minutes: 10, writes: 0 };
@@ -30,7 +31,7 @@ async function fixture(t, web = true) {
   return { ctx, route, binding, settings };
 }
 
-test('真实 Connection 在没有 WebServer 时仍能读取和保存设置，保留令牌与卸载行为', { timeout: 15_000 }, async t => {
+nativeTest('真实 Connection 在没有 WebServer 时仍能读取和保存设置，保留令牌与卸载行为', { timeout: 15_000 }, async t => {
   const f = await fixture(t, false), connection = f.ctx.get('connection');
   const carrier = connection.createSharedFetchHandler('/api');
   const request = (route, input, token) => carrier.fetch(new Request('http://127.0.0.1/api/douyin-browser' + route, { ...(input === undefined ? {} : { method: 'POST', body: JSON.stringify(input) }), headers: { 'content-type': 'application/json', ...(token ? { 'x-douyin-settings-token': token } : {}) } }), connection.browserPeer ?? connection.operator);
@@ -40,7 +41,7 @@ test('真实 Connection 在没有 WebServer 时仍能读取和保存设置，保
   await f.binding.dispose(); assert.equal((await request('/state')).status, 404);
 });
 
-test('真实 WebServer 与 Connection RPC 完整往返，未认证调用被拒绝，不依赖独立控制台', { timeout: 15_000 }, async t => {
+nativeTest('真实 WebServer 与 Connection RPC 完整往返，未认证调用被拒绝，不依赖独立控制台', { timeout: 15_000 }, async t => {
   const f = await fixture(t), connection = f.ctx.get('connection'), server = f.ctx.get('webServer');
   const base = `http://127.0.0.1:${server.port}`;
   const unregister = server.register({ kind: 'exact', path: '/', handler(req, res) { if (connection.authorizeIndex(req, res)) { res.writeHead(200); res.end('测试宿主'); } } });
@@ -57,7 +58,7 @@ test('真实 WebServer 与 Connection RPC 完整往返，未认证调用被拒�
   assert.equal(f.settings.minutes, 8);
 });
 
-test('桥接拒绝跨源、非所有者、未知接口和超长输入，预先取消不执行操作', { timeout: 15_000 }, async t => {
+nativeTest('桥接拒绝跨源、非所有者、未知接口和超长输入，预先取消不执行操作', { timeout: 15_000 }, async t => {
   const f = await fixture(t, false), rpc = createSettingsRpcHandler(f.route), fetcher = createSettingsFetchHandler(f.route);
   assert.equal((await rpc('request', { path: '/state' }, undefined, { principal: { kind: 'guest' } })).value.status, 403);
   assert.equal((await rpc('request', { path: '//evil/state' })).value.status, 400);

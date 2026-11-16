@@ -9,11 +9,12 @@ import { MemoryStore } from './memory.mjs?v=2';
 import { TOOL_DEFINITIONS, validateToolArguments } from './tool-definitions.mjs?v=18';
 import { VideoLimits } from './video-limits.mjs';
 import { resolveRuntimePaths, resolveNodeExecutable } from './runtime-paths.mjs?v=10';
-import { PersonaMemory } from './persona-memory.mjs?v=10';
+import { PersonaMemory } from './persona-memory.mjs?v=11';
 import { BrowserLauncher, connectDedicatedBrowser } from './browser-launcher.mjs';
 import { pauseExistingVideoPages } from './browser-pause.mjs';
 import { browserPageLabel, browserPageLock, findSharedPage, adoptSharedPreparePage } from './browser-pages.mjs';
 import { StoryboardFrameStore } from './video-storyboard.mjs';
+import { COMMENT_LIST_LIMIT, COMMENT_TEXT_LIMIT, validCommentId } from './comment-contract.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const SHARED_CAPTURE_MODE = Symbol('shared-video-frame-capture');
@@ -306,6 +307,11 @@ export function readPageState() {
   };
   const clean = value => (value ?? '').replace(/\s+/g, ' ').trim();
   const boundedAuthor = value => { const name = clean(value).replace(/^@\s*/, ''); return name && name.length <= 256 && !name.includes('\0') ? name : null; };
+  // 页面文案会把“展开相关搜索/展开合集/识别画面”等界面文字拼进标题，读到模型前先去掉这些尾巴。
+  const stripTitleUi = value => clean(value)
+    .replace(/(?:展开相关搜索|展开合集|展开全部|展开简介)[：:][\s\S]*$/u, '')
+    .replace(/(?:识别画面|展开)$/u, '')
+    .trim();
   const workId = value => {
     try { const u = new URL(value, location.href); return /\/(?:video|note)\/(\d+)/.exec(u.pathname)?.[1] || u.searchParams.get('modal_id') || u.searchParams.get('aweme_id'); } catch { return null; }
   };
@@ -341,14 +347,34 @@ export function readPageState() {
     const playerId=/(?:^|\s)video_(\d+)(?:\s|$)/.exec(element.closest('[data-e2e="player-container"]')?.className??'')?.[1],activeId=/(?:^|\s)video_(\d+)(?:\s|$)/.exec(activeContainer?.className??'')?.[1];
     videoIdentityConflict=Boolean(playerId&&activeId&&playerId!==activeId);
     const id = videoIdentityConflict?null:playerId || activeId || links.map(e=>workId(e.href)).find(Boolean) || workId(location.href) || null;
-    const authorElement = links.find(e => /\/user\//.test(e.href)) || [...(container?.querySelectorAll('span,div')??[])].find(e=>e.childElementCount===0 && /^@/.test(clean(e.textContent)) && visible(e));
+    // 评论、右侧推荐视频里的用户链接不属于本作品作者，不能拿来打开主页。
+    const nonAuthorArea='[data-e2e="comment-item"],[data-e2e="aweme-relate"],[data-e2e="related-video"],[data-e2e="recommend-list"],[data-e2e*="related"],[data-e2e*="recommend"]';
+    // 主页推荐流里的作者链接未必在作品容器内，退化为按距离找最近一个 @作者 链接
+    const nearestUserLink = () => {
+      const r0 = element.getBoundingClientRect();
+      let best = null, bestDistance = Infinity;
+      for (const link of document.querySelectorAll('a[href*="/user/"]')) {
+        if (!visible(link) || link.closest(privateArea) || link.closest(nonAuthorArea) || !/^@/.test(clean(link.textContent))) continue;
+        const r = link.getBoundingClientRect();
+        const distance = Math.hypot((r.left + r.width / 2) - (r0.left + r0.width / 2), (r.top + r.height / 2) - (r0.top + r0.height / 2));
+        if (distance < bestDistance) { bestDistance = distance; best = link; }
+      }
+      return best;
+    };
+    const userLinks = links.filter(e => /\/user\//.test(e.getAttribute('href') || '') && !/\/user\/self\/?$/.test(e.getAttribute('href') || '') && clean(e.textContent) !== '我的');
+    // 详情页作者区优先，其次是评论和推荐区之外的链接，最后才按原有顺序兜底。
+    const authorElement = userLinks.find(e => e.closest('[data-e2e="user-info"]')) || userLinks.find(e => !e.closest(nonAuthorArea)) || userLinks[0] || nearestUserLink() || [...(container?.querySelectorAll('span,div')??[])].find(e=>e.childElementCount===0 && /^@/.test(clean(e.textContent)) && visible(e));
+    const authorSecUid = authorElement ? /\/user\/([A-Za-z0-9_-]+)/.exec(authorElement.getAttribute?.('href') || authorElement.href || '')?.[1] ?? null : null;
     const titleElement = container?.querySelector('[data-e2e="video-desc"],[data-e2e="video-title"],[data-e2e="detail-video-info"],[class*="video-info-detail"]');
-    const detailAuthor=container?.querySelector('[data-e2e="related-video"]')?.innerText?.split('\n').map(clean).find(Boolean);
+    // 详情页头像链接没有文字，昵称从同一作者信息区第一行读取；推荐视频区的整块文本不能当作者。
+    const authorBlock=authorElement?.closest('[data-e2e="user-info"],[data-e2e*="author"]');
+    const detailAuthor=authorBlock?(authorBlock.innerText||'').split('\n').map(clean).find(Boolean):null;
     const captionAuthor=/@([^·\n]+)·/.exec(titleElement?.textContent??'')?.[1]?.trim();
     const r = element.getBoundingClientRect();
     video = { id, url: id ? `https://www.douyin.com/video/${id}` : null,
       author: boundedAuthor(authorElement?.textContent) || boundedAuthor(detailAuthor) || boundedAuthor(captionAuthor),
-      title: (clean(titleElement?.getAttribute('data-e2e')==='detail-video-info'?titleElement.innerText.split('\n')[0]:titleElement?.textContent) || clean(links.find(e=>workId(e.href))?.textContent)).slice(0, 1000) || null,
+      authorSecUid,
+      title: (stripTitleUi(titleElement?.getAttribute('data-e2e')==='detail-video-info'?titleElement.innerText.split('\n')[0]:titleElement?.textContent) || stripTitleUi(links.find(e=>workId(e.href))?.textContent)).slice(0, 1000) || null,
       time: element.currentTime, duration: Number.isFinite(element.duration) ? element.duration : null,
       paused: element.paused, muted: element.muted, readyState: element.readyState, ended:element.ended, loop:element.loop,
       width: element.videoWidth, height: element.videoHeight,
@@ -392,7 +418,14 @@ export function readPageState() {
         if(arrows.length===2){const a=arrows[0].getBoundingClientRect(),b=arrows[1].getBoundingClientRect();if(a.width>=12&&a.width<=64&&b.width>=12&&b.width<=64&&Math.abs(a.top-b.top)<4&&b.left>a.right&&!next.includes(arrows[1]))next.push(arrows[1]);}
       }
       const validCount=!index||!total||index<=total;
-      imagePost={id,url:`https://www.douyin.com/note/${id}`,recognized:true,source:'active-image-element',loaded:true,title:clean(activeContainer.querySelector('[data-e2e="video-desc"],[data-e2e="video-title"],[class*="video-info-detail"]')?.textContent).slice(0,1000)||null,
+      const imageAuthor=[...activeContainer.querySelectorAll('a[href*="/user/"]')].find(link=>visible(link));
+      const imageAuthorName=activeContainer.querySelector('[data-e2e="user-name"],[data-e2e="author-name"],[data-e2e="note-author"],[class*="author-name"]');
+      // 图文详情页的文案有时不在 video-desc 里，退回页面标题（去掉“ - 抖音”后缀），作者优先取可见作者链接。
+      const imageTitle=clean(activeContainer.querySelector('[data-e2e="video-desc"],[data-e2e="video-title"],[class*="video-info-detail"]')?.textContent)
+        || stripTitleUi(clean(document.title||'').replace(/\s*[-–]\s*抖音\s*$/u,''));
+      imagePost={id,url:`https://www.douyin.com/note/${id}`,recognized:true,source:'active-image-element',loaded:true,title:imageTitle.slice(0,1000)||null,
+        author:boundedAuthor(imageAuthor?.textContent)||boundedAuthor(imageAuthorName?.textContent)||boundedAuthor(/@([^\n·]+)/.exec(clean(activeContainer.innerText))?.[1]),
+        authorSecUid:imageAuthor?/\/user\/([A-Za-z0-9_-]+)/.exec(imageAuthor.getAttribute('href')||'')?.[1]??null:null,
         width:image.naturalWidth,height:image.naturalHeight,viewport:{x:Math.max(0,r.left),y:Math.max(0,r.top),width:Math.min(innerWidth,r.right)-Math.max(0,r.left),height:Math.min(innerHeight,r.bottom)-Math.max(0,r.top)},imageKey:marker((image.currentSrc||image.src)+'\0'+image.naturalWidth+'x'+image.naturalHeight+'\0'+(index||0)),album:{index:validCount?index:null,total:validCount?total:null,hasNext:validCount&&next.length===1&&!(index&&total&&index>=total),atEnd:Boolean(validCount&&index&&total&&index>=total),source:'visible-carousel-dom'},observationScope:'current-visible-image'};
     }
   }
@@ -432,18 +465,132 @@ export function readPageState() {
     for (const candidate of candidates) {
       const anchor = candidate.matches('a') ? candidate : candidate.querySelector('a[href*="/video/"],a[href*="modal_id="]');
       const id = workId(anchor?.href) || candidate.getAttribute('data-aweme-id') || /waterfall_item_(\d+)/.exec(candidate.closest('[id^="waterfall_item_"]')?.id??'')?.[1];
+      // 用户标签页的卡片没有作品链接，不能当成视频结果；“相关搜索”区块也不是作品。
+      if (!id || used.has(id)) continue;
       const card = candidate.closest('.search-result-card,[data-e2e="search-card"],[data-e2e="search-result"]') || candidate;
+      if (card.matches('[data-e2e*="related-search"],[class*="relatedSearch"],[class*="related-search"]')) continue;
       const leaves = [...card.querySelectorAll('div,span')].filter(e=>!e.childElementCount).map(e=>clean(e.textContent));
-      const title = clean(card.querySelector('[data-e2e="video-desc"],[data-e2e="video-title"]')?.textContent) || leaves.sort((a,b)=>b.length-a.length)[0] || clean(card.textContent);
-      if (!title || used.has(id || title)) continue;
-      used.add(id || title);
-      searchResults.push({ index: searchResults.length, id: id || null, url: id ? `https://www.douyin.com/video/${id}` : null,
+      const title = stripTitleUi(card.querySelector('[data-e2e="video-desc"],[data-e2e="video-title"]')?.textContent) || stripTitleUi(leaves.sort((a,b)=>b.length-a.length)[0]) || stripTitleUi(card.textContent);
+      if (!title || /^相关搜索/.test(title)) continue;
+      used.add(id);
+      searchResults.push({ index: searchResults.length, id, url: `https://www.douyin.com/video/${id}`,
         title: title.slice(0,1000), author: boundedAuthor(card.querySelector('a[href*="/user/"]')?.textContent) || boundedAuthor(/@([^\n·]+)/.exec(card.innerText)?.[1]) });
     }
   }
+  // 用户搜索结果：搜索页中可见的用户卡片
+  const userSearchResults = [];
+  if (location.pathname.startsWith('/search/')) {
+    // 只有“没有作品链接”的卡片才是用户结果；视频结果卡片也带作者链接，不能混进用户列表。
+    const userCards = [...document.querySelectorAll('.search-result-card')].filter(card => card.querySelector('a[href*="/user/"]') && !card.querySelector('a[href*="/video/"],a[href*="/note/"],a[href*="modal_id="]') && visible(card));
+    const seenUsers = new Set();
+    const parseCount = (text) => {
+      const m = /([\d.]+)\s*(万|亿)?/.exec(text || '');
+      if (!m) return null;
+      const n = Number(m[1]);
+      if (!Number.isFinite(n)) return null;
+      return m[2] === '万' ? Math.round(n * 10000) : m[2] === '亿' ? Math.round(n * 100000000) : n;
+    };
+    for (const card of userCards) {
+      const link = card.querySelector('a[href*="/user/"]');
+      const secUid = link ? /\/user\/([A-Za-z0-9_-]+)/.exec(link.getAttribute('href'))?.[1] : null;
+      if (!secUid || seenUsers.has(secUid)) continue;
+      seenUsers.add(secUid);
+      // 卡片内叶子节点依次是：昵称、关注按钮、抖音号、获赞、粉丝、简介……
+      const leaves = [...card.querySelectorAll('*')].filter(el => el.childElementCount === 0).map(el => clean(el.textContent)).filter(Boolean);
+      const followIdx = leaves.findIndex(t => /^(?:已关注|关注|相互关注)$/.test(t));
+      const from = followIdx >= 0 ? followIdx + 1 : 0;
+      // 抖音号可能被拆成多个叶子节点，连续拼接直到获赞/粉丝等计数文本
+      const idParts = [];
+      for (const t of leaves.slice(from)) {
+        if (/(?:获赞|粉丝)$/.test(t)) break;
+        if (/抖音号/.test(t)) continue;
+        // 抖音号可能带句点或前后标点，去掉尾部的句点后再判断字符集。
+        const text = t.replace(/^[.。:：]+|[.。:：]+$/gu, '');
+        if (!/^[A-Za-z0-9_.-]+$/.test(text)) break;
+        idParts.push(text);
+        if (idParts.join('').length >= 30) break;
+      }
+      const douyinId = idParts.join('') || null;
+      const followerText = leaves.find(t => /粉丝$/.test(t)) || '';
+      userSearchResults.push({
+        secUid,
+        nickname: leaves[0]?.slice(0, 100) || clean(link.textContent)?.slice(0, 100) || null,
+        douyinId: douyinId?.slice(0, 50) || null,
+        followerCount: parseCount(followerText),
+        followed: followIdx >= 0 && /已关注|相互关注/.test(leaves[followIdx]),
+      });
+    }
+  }
+  // 用户主页：解析资料和首屏作品列表
+  let userProfile = null;
+  const userSecUid = location.pathname.startsWith('/user/') ? /^\/user\/([A-Za-z0-9_-]+)/.exec(location.pathname)?.[1] : null;
+  if (userSecUid && !loginRequired && !verificationRequired && !privateChatVisible) {
+    const profileRoot = document.querySelector('[data-e2e="user-info"],[class*="userInfo"],[class*="user-info"],main') || document.body;
+    // 统计信息只取同时包含“关注/粉丝/获赞”的最短容器，避免整页隐藏文本里的同名词条抢先命中。
+    const statsText = (() => {
+      const roots = [profileRoot, ...document.querySelectorAll('[data-e2e="user-info"],[class*="userInfo"],[class*="user-info"],[class*="user-detail"],[class*="userDetail"]')].filter(Boolean);
+      let best = '';
+      for (const root of roots) {
+        const value = clean(root.textContent ?? '');
+        if (!/关注/.test(value) || !/粉丝/.test(value) || !/获赞/.test(value)) continue;
+        if (!best || value.length < best.length) best = value;
+      }
+      return best || clean(document.body.textContent);
+    })();
+    const parseCount = (num, unit) => {
+      const n = Number(num);
+      if (!Number.isFinite(n)) return null;
+      return unit === '万' ? Math.round(n * 10000) : unit === '亿' ? Math.round(n * 100000000) : n;
+    };
+    // 昵称：优先资料区首个叶子文本，其次页面标题
+    const nicknameLeaf = [...profileRoot.querySelectorAll('*')].filter(el => el.childElementCount === 0).map(el => clean(el.textContent)).find(t => t && t.length <= 60 && !/^(?:关注|已关注|相互关注|私信|发消息)$/.test(t));
+    const titleMatch = /^(.+?)(?:的主页)?\s*[-–]\s*抖音/.exec(document.title || '');
+    const nickname = (nicknameLeaf || titleMatch?.[1] || '').slice(0, 100) || null;
+    // 关注数：关注与粉丝之间（可带万/亿）
+    const followingMatch = /关注\s*([\d.]+)\s*(万|亿)?\s*粉丝/.exec(statsText);
+    const followingCount = followingMatch ? parseCount(followingMatch[1], followingMatch[2]) : null;
+    // 粉丝数：粉丝与获赞之间（可带万/亿）
+    const followerMatch = /粉丝\s*([\d.]+)\s*(万|亿)?\s*获赞/.exec(statsText);
+    const followerCount = followerMatch ? parseCount(followerMatch[1], followerMatch[2]) : null;
+    // 获赞数：获赞之后（可带万/亿）
+    const likeMatch = /获赞\s*([\d.]+)\s*(万|亿)?/.exec(statsText);
+    const likeCount = likeMatch ? parseCount(likeMatch[1], likeMatch[2]) : null;
+    // 抖音号：匹配到 IP属地、获赞等关键词之前
+    const douyinIdMatch = /抖音号[:：]\s*([A-Za-z0-9_-]+?)(?=IP属地|获赞|粉丝|$)/.exec(statsText);
+    const douyinId = douyinIdMatch?.[1]?.slice(0, 50) || null;
+    // 简介：IP属地 + 省份 + 性别 + 省份·城市 之后到"更多/分享主页"等界面文字之前
+    const bioMatch = /IP属地[：:]\s*[^男女·\s]{2,4}(?:男|女)?[^·\s]{0,4}·?[^·\s]{2,4}\s*(.+?)(?:\.{2,}更多|更多|分享主页|互相关注|私信|下载电脑客户端|作品|$)/.exec(statsText);
+    const bio = bioMatch?.[1]?.trim()?.slice(0, 500) || null;
+    const verified = profileRoot.querySelector('[data-e2e="verify-badge"],[class*="verify-badge"],[class*="verified"]') !== null || /官方认证|企业认证|机构认证/.test(statsText);
+    // 作品列表：只取主页作品区，避免把页脚推荐或 SEO 链接误当成本人作品
+    const works = [];
+    const worksRoot = document.querySelector('[data-e2e="user-post-list"]');
+    const allWorkAnchors = worksRoot ? [...worksRoot.querySelectorAll('a[href*="/video/"],a[href*="/note/"]')].filter(a => visible(a)) : [];
+    const workAnchors = allWorkAnchors.slice(0, 30);
+    const seenWorks = new Set();
+    for (const anchor of workAnchors) {
+      const id = workId(anchor.href);
+      if (!id || seenWorks.has(id)) continue;
+      seenWorks.add(id);
+      const linkText = clean(anchor.textContent);
+      // 文本格式：[置顶]{点赞数}{标题}，点赞数可能是纯数字或带万/亿
+      const rest = linkText.replace(/^置顶/, '');
+      const likeAndTitle = /^([\d.]+)\s*(万|亿)?\s*(.+)$/.exec(rest);
+      // 作品卡片的无障碍文本会把标题重复一遍，等长前后半段相同时收敛为一份
+      const dedupe = text => text.length % 2 === 0 && text.slice(0, text.length / 2) === text.slice(text.length / 2) ? text.slice(0, text.length / 2) : text;
+      const title = stripTitleUi(dedupe((likeAndTitle?.[3] || rest).trim())).slice(0, 200) || null;
+      const likeCount2 = likeAndTitle ? parseCount(likeAndTitle[1], likeAndTitle[2]) : null;
+      works.push({ id, url: `https://www.douyin.com/${/\/note\//.test(anchor.href) ? 'note' : 'video'}/${id}`, title, likeCount: likeCount2 });
+    }
+    userProfile = { secUid: userSecUid, nickname, douyinId, followerCount, followingCount, likeCount, bio, verified, works, worksTruncated: allWorkAnchors.length > workAnchors.length };
+  }
   const u = new URL(location.href);
-  for (const key of [...u.searchParams.keys()]) if (!['modal_id','aweme_id','recommend'].includes(key)) u.searchParams.delete(key);
-  return { url: u.href, title: document.title, video, imagePost, liveRoom, videoSelection: { candidateCount: videoElements.length, ambiguous: videoElements.length > 1 || videoIdentityConflict, identityConflict: videoIdentityConflict }, pageKind: liveRoom?'live-room':livePreview ? 'live-preview' : imagePost ? 'image-post' : video?.id ? 'video' : location.pathname.startsWith('/search/') ? 'search' : 'unknown', livePreview, searchResults: searchResults.slice(0,20), visibleText: directLive?'':text,
+  for (const key of [...u.searchParams.keys()]) if (!['modal_id','aweme_id','recommend','type'].includes(key)) u.searchParams.delete(key);
+  // 关闭主页弹层后，残留播放器不能再把作品网格误报为视频详情。
+  const profileGrid = Boolean(userProfile && !u.searchParams.has('modal_id') && !u.searchParams.has('aweme_id'));
+  if (profileGrid) video = null;
+  const pageKind = liveRoom?'live-room':livePreview ? 'live-preview' : profileGrid ? 'user-profile' : imagePost ? 'image-post' : video?.id ? 'video' : userProfile ? 'user-profile' : location.pathname.startsWith('/search/') ? (userSearchResults.length ? 'user-search' : 'search') : 'unknown';
+  return { url: u.href, title: document.title, video, imagePost, liveRoom, videoSelection: { candidateCount: videoElements.length, ambiguous: videoElements.length > 1 || videoIdentityConflict, identityConflict: videoIdentityConflict }, pageKind, livePreview, searchResults: searchResults.slice(0,20), userSearchResults: userSearchResults.slice(0,20), userProfile, visibleText: directLive?'':text,
     loginRequired, verificationRequired, privateChatVisible, documentReadyState: document.readyState };
 }
 
@@ -531,6 +678,8 @@ export class BrowserController {
   limits() { return this.videoLimits ??= new VideoLimits(); }
   getMediaAdapter() { return this.mediaPromise??=import('./media/index.mjs?v=10').then(({MediaAdapter})=>new MediaAdapter()); }
   getForwarder() { return this.forwarderPromise??=import('./video-forward.mjs?v=10').then(({VideoForwarder})=>new VideoForwarder({videoLimits:this.limits(),source:this.source==='dsh'?'dsh':'api'})); }
+  getOutboundMessageService() { return this.outboundPromise??=import('./outbound-message.mjs').then(({OutboundMessageService})=>new OutboundMessageService({controller:this,stateDir:this.limits().stateDir,source:this.source==='dsh'?'dsh':'api'})); }
+  getProfileViewService() { return this.profileViewPromise??=import('./profile-view.mjs').then(({ProfileViewService})=>new ProfileViewService({stateDir:this.limits().stateDir})); }
   watchVideoLimits() {
     if (!this.limitsEnabled || this.cancelLimitsWatch) return;
     this.cancelLimitsWatch = this.limits().watch({ sources:[this.source], pause:()=>this.pauseForLimits() });
@@ -577,7 +726,7 @@ export class BrowserController {
   }
   store() { return this.memory ??= new MemoryStore(resolveRuntimePaths().memoryDbPath); }
   async observeSharedWork(input) {
-    const { AutonomousWatch } = await import('./autonomous-watch.mjs?v=10');
+    const { AutonomousWatch } = await import('./autonomous-watch.mjs?v=21');
     const release = await lock('chat-shared-video', input.signal, this.controlDirectory);
     try {
       return await observeChatSharedWork({ ...input, videoLimits: this.limits(),
@@ -594,7 +743,7 @@ export class BrowserController {
     return this.personaMemory;
   }
   getChatService() {
-    this.chatPromise??=Promise.all([import('./chat-browser.mjs?v=18'),import('./chat-service.mjs?v=18'),import('./usage-ledger.mjs')])
+    this.chatPromise??=Promise.all([import('./chat-browser.mjs?v=18'),import('./chat-service.mjs?v=19'),import('./usage-ledger.mjs')])
       .then(([{ChatBrowser},{ChatService},{UsageLedger}])=>{const stateDir=this.limits().stateDir,source=this.source==='dsh'?'dsh':'api';const service=new ChatService({stateDir,browser:new ChatBrowser({source:source==='dsh'?'dsh-chat':'api-chat'}),onPrepared:options=>this.releaseIdlePreparePage(options),observeSharedWork:input=>this.observeSharedWork(input),videoLimits:this.limits()});service.agent.personaMemory=this.getPersonaMemory();service.agent.getMemoryStore=()=>this.store();service.agent.createConversationMemory=({scopeToken,messages})=>{const contact=memoryContactFromToken(scopeToken);return createRuntimeConversationMemory({store:this.store(),contact,messages,host:source==='dsh'?'dsh':'desktop',isAuthorized:()=>service.isMemoryScopeAuthorized(contact)});};service.agent.usageLedger=new UsageLedger({stateDir});service.agent.source=source;return service;})
       .catch(error=>{this.chatPromise=null;throw error;});
     return this.chatPromise;
@@ -604,12 +753,36 @@ export class BrowserController {
     return this.sparkPromise;
   }
   getCommenter() {
-    this.commenterPromise ??= import('./comment-browser.mjs?v=18').then(({ CommentBrowser }) => new CommentBrowser({ source: this.source === 'dsh' ? 'dsh' : 'api', videoLimits: this.limits(), stateDir: this.limits().stateDir })).catch(error => { this.commenterPromise = null; throw error; });
+    this.commenterPromise ??= import('./comment-browser.mjs?v=20').then(({ CommentBrowser }) => new CommentBrowser({ source: this.source === 'dsh' ? 'dsh' : 'api', videoLimits: this.limits(), stateDir: this.limits().stateDir })).catch(error => { this.commenterPromise = null; throw error; });
     return this.commenterPromise;
   }
   getComments() {
     this.commentsPromise ??= import('./autonomous-comments.mjs?v=10').then(({ AutonomousComments }) => new AutonomousComments({ controller: this, personaMemory: this.getPersonaMemory(), videoLimits: this.limits(), stateDir: this.limits().stateDir, source: this.source === 'dsh' ? 'dsh' : 'api' })).catch(error => { this.commentsPromise = null; throw error; });
     return this.commentsPromise;
+  }
+  // 复用评论模块的读取、身份核对与面板展开，只返回评论文本，不采集其他评论者资料。
+  async readComments(signal) {
+    signal?.throwIfAborted();
+    const state = await this.state({ record: false });
+    const videoId = state.video?.id;
+    if (!/^\d{10,30}$/.test(videoId || '')) throw new Error('当前没有可核对的作品，未读取评论。');
+    if (state.loginRequired || state.verificationRequired || state.blocked || state.privateChatVisible || state.unsupportedPage) throw Object.assign(new Error('页面需要手动处理，未读取评论。'), { watchStatus: 'needs_user' });
+    const { ensureCommentPanel, readCommentDom, readCommentSelfIdentity } = await import('./comment-browser.mjs?v=20');
+    const identity = await this.page.evaluate(readCommentSelfIdentity);
+    signal?.throwIfAborted();
+    if (!identity.ready) throw Object.assign(new Error('登录本人身份缺失或冲突，未读取评论。'), { needsUserAction: true, reasonCode: identity.reasonCode });
+    const panel = await ensureCommentPanel(this.page, { signal });
+    // 评论面板展开后列表仍会懒加载，给一个有上限的等待；没有评论时正常返回空列表。
+    let rows = [];
+    const deadline = Date.now() + 3000;
+    for (;;) {
+      ({ rows } = await this.page.evaluate(readCommentDom, { expectedVideoId: videoId, ownProfileId: identity.ownProfileId }));
+      if (rows.length || Date.now() >= deadline) break;
+      await new Promise(resolve => setTimeout(resolve, 250));
+      signal?.throwIfAborted();
+    }
+    // 只有同时有正文和稳定编号的行才进入模型列表；发布端使用同一投影，序号不会因无法绑定的行错位。
+    return { videoId, expanded: panel.expanded === true || panel.alreadyOpen === true, comments: rows.filter(row => row.text && validCommentId(row.commentId)).slice(0, COMMENT_LIST_LIMIT).map(row => ({ commentId: row.commentId, videoId: row.videoId, text: row.text.slice(0, COMMENT_TEXT_LIMIT), mine: row.mine === true })) };
   }
   getReport() {
     this.reportPromise ??= import('./daily-report.mjs?v=10').then(({ DailyReport }) => new DailyReport({ personaMemory: this.getPersonaMemory() })).catch(error => { this.reportPromise = null; throw error; });
@@ -738,10 +911,11 @@ export class BrowserController {
     if (url === RECOMMEND && this.page.url().includes('/jingxuan')) {
       await this.page.locator('a').filter({hasText:/^推荐$/}).click();
     }
-    const targetId=/\/(?:video|note)\/(\d+)/.exec(url)?.[1];
-    await this.settle(signal, {kind:targetId?'video':url.includes('/search/')?'search':'recommend',videoId:targetId});
+    const targetId=/\/(?:video|note)\/(\d+)/.exec(url)?.[1], targetUser=/\/user\/[A-Za-z0-9_-]+/.test(url);
+    await this.settle(signal, {kind:targetId?'video':targetUser?'user':url.includes('/search/')?'search':'recommend',videoId:targetId});
   }
   async settle(signal, {kind='recommend',videoId}={}) {
+    let userWaited = 0;
     for (let i=0;i<=60;i++) {
       aborted(signal);
       const state = await this.evaluatePage(readPageState,undefined,signal);
@@ -751,11 +925,17 @@ export class BrowserController {
       const imageReady=state.pageKind==='image-post'&&state.imagePost?.recognized===true&&state.imagePost.source==='active-image-element'&&state.imagePost.loaded===true;
       if(kind==='search' && state.searchResults.length && !detail) return state;
       if(kind==='search' && /暂无搜索结果|没有找到相关|暂无结果/.test(state.visibleText)) return state;
+      // 主页资料与作品列表都在首屏异步渲染：作品为空时再多等 3 秒，避免把“还没渲染”当成“没有作品”。
+      if(kind==='user' && state.pageKind==='user-profile' && state.userProfile) {
+        const emptyProfile=/暂无作品|还未发布|还没有作品|暂未发布|没有作品/.test(state.visibleText||'');
+        if(state.userProfile.works?.length || emptyProfile) return state;
+        if(++userWaited >= 6) return state;
+      }
       if(kind==='video' && detail && (state.video?.id===videoId && state.video.readyState>=2 || imageReady&&state.imagePost.id===videoId)) return state;
       if(kind==='recommend' && (state.video?.id && state.video.readyState>=2 || imageReady || state.livePreview?.recognized === true)) return state;
       if(i<60)await wait(500, signal);
     }
-    throw new Error(kind==='search'?'搜索结果未就绪，未确认搜索完成。':kind==='video'?'目标作品尚未加载完成，请读取状态后重试。':'推荐流尚未读到就绪视频。');
+    throw new Error(kind==='search'?'搜索结果未就绪，未确认搜索完成。':kind==='user'?'用户主页未就绪，请读取状态后重试。':kind==='video'?'目标作品尚未加载完成，请读取状态后重试。':'推荐流尚未读到就绪视频。');
   }
   async state({ record = true } = {}) {
     const state = await this.evaluatePage(readPageState);
@@ -782,10 +962,11 @@ export class BrowserController {
     });
     this.queue=operation;return operation;
   }
-  execute(name, args = {}, { signal, humanAuthorized = false, autonomousRunId, expectedVideoId, expectedImageKey, advanceImage=false, expectedLiveRoomId, expectedLivePreviewKey, enterLive=false, exitLive=false, sharedCaptureMode } = {}) {
+  execute(name, args = {}, { signal, humanAuthorized = false, autonomousRunId, expectedVideoId, expectedImageKey, advanceImage=false, expectedLiveRoomId, expectedLivePreviewKey, enterLive=false, exitLive=false, sharedCaptureMode, profileWork=false } = {}) {
     const definition = TOOL_DEFINITIONS.find(tool=>tool.name===name);
     if (!definition) return Promise.reject(new Error('不支持的抖音工具。'));
     if (sharedCaptureMode !== undefined && (sharedCaptureMode !== SHARED_CAPTURE_MODE || name !== 'douyin_observe')) return Promise.reject(new Error('内部分享采样模式未由宿主授权。'));
+    if(profileWork!==false&&(profileWork!==true||name!=='douyin_open_video'||!args.url))return Promise.reject(new TypeError('主页弹层打开只能由自主观看绑定已读取的作品链接。'));
     try {
       if(sharedCaptureMode===SHARED_CAPTURE_MODE){if(!args||typeof args!=='object'||Array.isArray(args)||Object.keys(args).some(key=>key!=='seconds')||!Number.isFinite(args.seconds)||args.seconds<0.2||args.seconds>30)throw new TypeError('本机分享视频单批采集参数无效。');}
       else validateToolArguments(definition,args);
@@ -822,6 +1003,17 @@ export class BrowserController {
           }
         }
       }
+      if(name==='douyin_message_user') {
+        const outbound=await this.getOutboundMessageService();aborted(signal);
+        // 私信同样会导航专用页面：取得与观看/回复相同的跨进程页面锁，并先建立连接再发送。
+        const releaseMessage=await lock(browserPageLock(this.source),signal,this.controlDirectory);
+        try {
+          await this.connect(signal);
+          aborted(signal);
+          if (['api', 'dsh'].includes(this.source)) await (await this.getWatchMode()).apply(this.page);
+          return await outbound.sendToUser(args,{signal});
+        } finally { releaseMessage(); }
+      }
       if(name.startsWith('douyin_chat_')) {
         const chat=await this.getChatService();aborted(signal);
         if(name==='douyin_chat_contacts') return chat.listContacts({signal});
@@ -848,7 +1040,7 @@ export class BrowserController {
       if (name==='douyin_recall') return this.store().recall({query:args.query??'',limit:args.limit??10});
       if (name==='douyin_persona_status') return this.getPersonaMemory().snapshot();
       if (name==='douyin_watch_status') {
-        const {AutonomousWatch}=await import('./autonomous-watch.mjs?v=10');
+        const {AutonomousWatch}=await import('./autonomous-watch.mjs?v=21');
         this.watchStatusReader??=new AutonomousWatch({controller:this,config:{},videoLimits:this.limits(),personaMemory:this.getPersonaMemory(),source:this.source==='dsh'?'dsh':'api',stateDir:this.limits().stateDir});
         return this.watchStatusReader.state();
       }
@@ -877,14 +1069,58 @@ export class BrowserController {
         }
         await this.checkVideoLimits(name);
         if(this.limitsEnabled && !this.limits().state().allowed) await this.pauseForLimits();
-        if(!['douyin_open','douyin_search','douyin_open_video'].includes(name) && new URL(this.page.url()).origin!=='https://www.douyin.com'&&!/^https:\/\/live\.douyin\.com\/\d{4,30}\/?(?:[?#]|$)/.test(this.page.url())) {
+        if(!['douyin_open','douyin_search','douyin_open_video','douyin_search_user','douyin_open_user'].includes(name) && new URL(this.page.url()).origin!=='https://www.douyin.com'&&!/^https:\/\/live\.douyin\.com\/\d{4,30}\/?(?:[?#]|$)/.test(this.page.url())) {
           return this.page.evaluate(readPageState);
         }
         if (name==='douyin_open') await this.navigate(RECOMMEND,signal);
         if (name==='douyin_search') await this.navigate(`https://www.douyin.com/search/${encodeURIComponent(args.query)}`,signal);
+        if (name==='douyin_search_user') await this.navigate(`https://www.douyin.com/search/${encodeURIComponent(args.query)}?type=user`,signal);
+        if (name==='douyin_open_user') {
+          const userUrl = args.url || `https://www.douyin.com/user/${args.secUid}`;
+          const targetSecUid = args.secUid || /^https:\/\/www\.douyin\.com\/user\/([^/?#]+)/.exec(userUrl)?.[1];
+          const currentUrl = new URL(this.page.url());
+          // 已在这个作者主页的作品弹层中时，优先按 Esc 返回作品列表，避免重新加载主页。
+          if(targetSecUid&&currentUrl.origin==='https://www.douyin.com'&&currentUrl.pathname===`/user/${targetSecUid}`&&currentUrl.searchParams.has('modal_id')) {
+            await this.page.keyboard.press('Escape');
+            let closed=false;
+            for(let attempt=0;attempt<12;attempt++) {
+              await wait(250,signal);
+              const state=await this.state({record:false}),url=new URL(state.url);
+              if(url.pathname===`/user/${targetSecUid}`&&!url.searchParams.has('modal_id')&&state.userProfile?.secUid===targetSecUid){closed=true;break;}
+            }
+            if(!closed)await this.navigate(userUrl,signal);
+          } else await this.navigate(userUrl,signal);
+        }
         if (name==='douyin_open_video') {
-          if (args.url) await this.navigate(`https://www.douyin.com/video/${/\/video\/(\d+)/.exec(args.url)[1]}`,signal);
-          else {
+          if (args.url) {
+            const noteId=/\/note\/(\d+)/.exec(args.url)?.[1], videoId2=/\/video\/(\d+)/.exec(args.url)?.[1],workId2=noteId||videoId2;
+            if(profileWork) {
+              // 自主观看：只点击当前主页作品区里 ID 完全匹配的封面，并核对弹层身份。
+              try {
+                const before=await this.state({record:false});
+                if(before.pageKind!=='user-profile'||!before.userProfile?.works?.some(item=>item.id===workId2))throw new Error('当前页面不是包含该作品的作者主页。');
+                const anchors=this.page.locator('[data-e2e="user-post-list"] a[href*="/video/"],[data-e2e="user-post-list"] a[href*="/note/"]').filter({visible:true});
+                const hrefs=await anchors.evaluateAll(nodes=>nodes.map(node=>node.href));
+                const matches=hrefs.map((href,index)=>{try{return new URL(href).pathname.match(/\/(?:video|note)\/(\d+)/)?.[1]===workId2?index:-1;}catch{return -1;}}).filter(index=>index>=0);
+                if(matches.length!==1)throw new Error('主页中没有唯一的目标作品封面。');
+                await anchors.nth(matches[0]).click();
+                for(let attempt=0;attempt<24;attempt++) {
+                  await wait(250,signal);
+                  const opened=await this.state({record:false}),openedId=opened.video?.id||opened.imagePost?.id;
+                  const imageReady=opened.pageKind==='image-post'&&opened.imagePost?.recognized===true&&opened.imagePost?.loaded===true;
+                  if(new URL(opened.url).searchParams.get('modal_id')===workId2&&openedId===workId2&&(opened.video?.readyState>=2||imageReady))return opened;
+                  if(opened.loginRequired||opened.verificationRequired)throw Object.assign(new Error('打开作品弹层后需要登录或验证。'),{code:'PROFILE_MODAL_NEEDS_USER',watchStatus:'needs_user'});
+                }
+                throw new Error('点击封面后未读到目标作品弹层。');
+              } catch(error) {
+                if(signal?.aborted||error.code==='PROFILE_MODAL_NEEDS_USER')throw error;
+                throw Object.assign(new Error(`主页作品弹层未能打开：${error.message}`),{code:'PROFILE_MODAL_FAILED'});
+              }
+            }
+            if(noteId) await this.navigate(`https://www.douyin.com/note/${noteId}`,signal);
+            else if(videoId2) await this.navigate(`https://www.douyin.com/video/${videoId2}`,signal);
+            else throw new Error('作品链接无效，请重新搜索或从主页选择。');
+          } else {
             const before = await this.state();
             const result = before.searchResults.find(item=>item.index===args.index);
             if (!result) throw new Error('这个 index 不在当前可见搜索结果内，请重新搜索。');
@@ -902,6 +1138,7 @@ export class BrowserController {
           await (await this.currentVideo()).evaluate(async(video, play)=>{ if(play) await video.play();else video.pause(); },name==='douyin_play');
           if (name==='douyin_play') await wait(600,signal);
         }
+        if (name==='douyin_read_comments') return await this.readComments(signal);
         if (name==='douyin_observe'||name==='douyin_screenshot') {
           const result=await this.capture(name==='douyin_observe'?args.seconds??3:0,signal,{recordLearning:!autonomousRunId,sharedCaptureMode});
           if(sharedCaptureMode===undefined){this.storyboardFrames??=new StoryboardFrameStore();try{const id=this.storyboardFrames.remember(result);if(id)result.storyboardSampleId=id;}catch{this.storyboardFrames.clear();}}

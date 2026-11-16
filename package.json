@@ -1,6 +1,6 @@
 {
   "name": "dsh-douyin-browser-local",
-  "version": "1.4.7",
+  "version": "1.4.12",
   "type": "module",
   "description": "DSH 原生抖音工具与独立 DeepSeek 本地助手",
   "license": "MIT",
@@ -37,6 +37,8 @@
     "@playwright/mcp": "0.0.83"
   },
   "files": [
+    "app.mjs",
+    "public/index.html",
     "chat-output.mjs",
     "group-video-inbox.mjs",
     "browser-pages.mjs",
@@ -69,6 +71,7 @@
     "group-reply-trigger.mjs",
     "client.js",
     "comment-browser.mjs",
+    "comment-contract.mjs",
     "cordis.bundle.yml",
     "core.mjs",
     "daily-report.mjs",
@@ -82,10 +85,12 @@
     "native-spark-greeting.mjs",
     "native-watch-decision.mjs",
     "outbound-send.mjs",
+    "outbound-message.mjs",
     "receipt-baseline.mjs",
     "persona-memory.mjs",
     "playwright-runtime.mjs",
     "public-comment-agent.mjs",
+    "profile-view.mjs",
     "qq-sync.mjs",
     "runtime-paths.mjs",
     "spark-agent.mjs",

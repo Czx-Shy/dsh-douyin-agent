@@ -127,7 +127,7 @@ export function createApiServer({ controller, config, personaMemory, watchServic
       if (request.method === 'GET' && url.pathname === '/') return reply(response, 200, await fs.readFile(htmlFile), 'text/html; charset=utf-8');
       if (request.method === 'GET' && url.pathname === '/api/bootstrap') {
         const memory = resolveRuntimePaths();
-        return reply(response, 200, { service: 'douyin-api-local', version: 1, sections: SETTINGS_SECTIONS, token, videoTime: { enabled: Boolean(videoLimits) }, media: { available: Boolean(mediaAdapter) }, watch: { available: Boolean(watchService) }, share: { available: Boolean(shareService) }, spark: { available: false }, comments: { available: Boolean(commentService) }, reports: { available: Boolean(reportService) }, mode: { available: Boolean(modeService) }, persona: { available: Boolean(personaMemory) }, forward: { available: Boolean(chatService && videoLimits) }, config: redact(publicApiConfig(config), [config.apiKey]), limits: { maxSteps: agent.maxSteps ?? DEFAULT_LIMITS.maxSteps, maxToolCalls: agent.maxToolCalls ?? DEFAULT_LIMITS.maxToolCalls, taskTimeoutSeconds: (agent.taskTimeoutMs ?? DEFAULT_LIMITS.taskTimeoutMs) / 1_000, apiTimeoutSeconds: (agent.apiTimeoutMs ?? DEFAULT_LIMITS.apiTimeoutMs) / 1_000, maxTokens: agent.maxTokens ?? DEFAULT_LIMITS.maxTokens, maxFrames: agent.maxFrames ?? DEFAULT_LIMITS.maxFrames }, memory: { description: '与 QQ 机器人共享的记忆 / 视频笔记。具体连通状态以检索结果为准。', folder: memory.memoryDir, database: memory.memoryDbPath } });
+        return reply(response, 200, { service: 'douyin-api-local', version: 1, sections: SETTINGS_SECTIONS, token, videoTime: { enabled: Boolean(videoLimits) }, media: { available: Boolean(mediaAdapter) }, watch: { available: Boolean(watchService) }, share: { available: Boolean(shareService) }, spark: { available: false }, comments: { available: Boolean(commentService) }, outbound: { available: typeof controller?.getOutboundMessageService === 'function' }, profileView: { available: typeof controller?.getProfileViewService === 'function' }, reports: { available: Boolean(reportService) }, mode: { available: Boolean(modeService) }, persona: { available: Boolean(personaMemory) }, forward: { available: Boolean(chatService && videoLimits) }, config: redact(publicApiConfig(config), [config.apiKey]), limits: { maxSteps: agent.maxSteps ?? DEFAULT_LIMITS.maxSteps, maxToolCalls: agent.maxToolCalls ?? DEFAULT_LIMITS.maxToolCalls, taskTimeoutSeconds: (agent.taskTimeoutMs ?? DEFAULT_LIMITS.taskTimeoutMs) / 1_000, apiTimeoutSeconds: (agent.apiTimeoutMs ?? DEFAULT_LIMITS.apiTimeoutMs) / 1_000, maxTokens: agent.maxTokens ?? DEFAULT_LIMITS.maxTokens, maxFrames: agent.maxFrames ?? DEFAULT_LIMITS.maxFrames }, memory: { description: '与 QQ 机器人共享的记忆 / 视频笔记。具体连通状态以检索结果为准。', folder: memory.memoryDir, database: memory.memoryDbPath } });
       }
       if (request.method === 'GET' && !url.pathname.startsWith('/api/') && staticRoot) {
         const asset = await staticAsset(staticRoot, url.pathname);
@@ -143,6 +143,24 @@ export function createApiServer({ controller, config, personaMemory, watchServic
       if (url.pathname === '/api/watch/options') {
         if (request.method === 'GET') return reply(response, 200, optionsService.state());
         if (request.method === 'POST') return reply(response, 200, optionsService.configure(await readJson(request), { explicit: true }));
+      }
+      if (url.pathname.startsWith('/api/outbound/')) {
+        if (request.method === 'GET' && url.pathname === '/api/outbound/state') return reply(response, 200, await (await controller.getOutboundMessageService()).state());
+        if (request.method === 'POST' && url.pathname === '/api/outbound/configure') {
+          const body = await readJson(request);
+          if (Object.keys(body).some(key => !['enabled', 'dailyLimit', 'minIntervalSeconds', 'autoFollow', 'dmPrompt'].includes(key))) return reply(response, 400, { error: '主动私信设置只接收开关、每日上限、最小间隔、自动关注和私信提示词。' });
+          return reply(response, 200, await (await controller.getOutboundMessageService()).configure(body, { explicit: true }));
+        }
+        return reply(response, 404, { error: '主动私信接口不存在。' });
+      }
+      if (url.pathname.startsWith('/api/profile-view/')) {
+        if (request.method === 'GET' && url.pathname === '/api/profile-view/state') return reply(response, 200, await (await controller.getProfileViewService()).state());
+        if (request.method === 'POST' && url.pathname === '/api/profile-view/configure') {
+          const body = await readJson(request);
+          if (Object.keys(body).some(key => !['enabled', 'dailyLimit', 'prompt'].includes(key))) return reply(response, 400, { error: '查看主页设置只接收开关、每日上限和提示词。' });
+          return reply(response, 200, await (await controller.getProfileViewService()).configure(body, { explicit: true }));
+        }
+        return reply(response, 404, { error: '查看主页接口不存在。' });
       }
       if (url.pathname.startsWith('/api/comments/')) {
         if (!commentService) return reply(response, 503, { error: '自主评论服务尚未就绪。' });
@@ -221,7 +239,7 @@ export function createApiServer({ controller, config, personaMemory, watchServic
       if (url.pathname.startsWith('/api/share/')) {
         if (!shareService) return reply(response, 503, { error: '自主分享模块尚未就绪。' });
         if (request.method === 'GET' && url.pathname === '/api/share/state') return reply(response, 200, redact(shareService.state(), [config.apiKey]));
-        if (request.method === 'POST' && url.pathname === '/api/share/configure') { const body=await readJson(request); if(Object.keys(body).some(key=>!['enabled','dailyLimit'].includes(key)))return reply(response,400,{error:'好友互动只接受总开关。'}); await friendInteractions.configure({enabled:body.enabled},{explicit:true}); return reply(response,200,redact(shareService.state(),[config.apiKey])); }
+        if (request.method === 'POST' && url.pathname === '/api/share/configure') { const body=await readJson(request); if(Object.keys(body).some(key=>key!=='enabled'))return reply(response,400,{error:'好友互动只接受总开关；分享不再单独限制每日次数。'}); await friendInteractions.configure({enabled:body.enabled},{explicit:true}); return reply(response,200,redact(shareService.state(),[config.apiKey])); }
         if (request.method === 'POST' && url.pathname === '/api/share/resolve') {
           const body = await readJson(request);
           if (Object.keys(body).some(key => !['operationId', 'outcome'].includes(key))) return reply(response, 400, { error: '核对记录只接受记录编号和实际发送结果。' });

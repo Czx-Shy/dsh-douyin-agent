@@ -39,6 +39,52 @@ function fixture(t) {
   return { root, watch, options, controller, videoLimits, personaMemory, memory, calls, events, state, paused: () => paused, now: () => clock, advance: ms => { clock += ms; }, provider: value => { provider = value; }, other: source => { const instance = new AutonomousWatch({ ...options, source }); instances.push(instance); return instance; } };
 }
 
+function profileFixture(t, openWork = ({ opened }) => opened) {
+  const f = fixture(t), secUid = 'synthetic-author', id = '7579432563794584939', calls = [];
+  const profile = { url: `https://www.douyin.com/user/${secUid}`, pageKind: 'user-profile', loginRequired: false, verificationRequired: false, privateChatVisible: false, userProfile: { secUid, nickname: '合成作者', works: [{ id, title: '合成作品', url: `https://www.douyin.com/video/${id}` }] } };
+  const opened = { url: `https://www.douyin.com/user/${secUid}?modal_id=${id}`, pageKind: 'video', loginRequired: false, verificationRequired: false, privateChatVisible: false, video: { id, readyState: 4, paused: false } };
+  f.controller.getProfileViewService = async () => ({ reserve: async () => 'synthetic-reservation', settle: async () => {}, state: () => ({ remaining: 1 }), policy: () => ({ prompt: '' }) });
+  Object.assign(f.watch, {
+    abort: new AbortController(),
+    agent: { decideProfile: async () => ({ decision: { action: 'open_work', workId: id, reason: '合成选择' }, usage: {} }) },
+    reserveRequest: () => {}, assertAllowed: () => {}, save: () => {},
+  });
+  f.watch.execute = async (name, args, options) => {
+    calls.push({ name, args, options });
+    return name === 'douyin_open_video' ? openWork({ opened, args, options, calls }) : profile;
+  };
+  return { ...f, secUid, id, profile, opened, profileCalls: calls };
+}
+
+test('主页作品优先点击弹层，并记录到本次连续观看会话', async t => {
+  const f = profileFixture(t), result = await f.watch.visitAuthor({ video: { authorSecUid: f.secUid } });
+  const calls = f.profileCalls.filter(call => call.name === 'douyin_open_video');
+  assert.equal(calls.length, 1); assert.equal(calls[0].options.profileWork, true);
+  assert.equal(result.current.url, f.opened.url); assert.deepEqual(f.watch.profileSession.watched, [f.id]);
+});
+
+test('主页弹层失败只回退一次作品直链', async t => {
+  let attempts = 0;
+  const f = profileFixture(t, ({ opened }) => {
+    if (++attempts === 1) throw Object.assign(new Error('合成弹层失败'), { code: 'PROFILE_MODAL_FAILED' });
+    return { ...opened, url: `https://www.douyin.com/video/${opened.video.id}` };
+  });
+  const result = await f.watch.visitAuthor({ video: { authorSecUid: f.secUid } });
+  const calls = f.profileCalls.filter(call => call.name === 'douyin_open_video');
+  assert.equal(calls.length, 2); assert.equal(calls[0].options.profileWork, true); assert.equal(calls[1].options.profileWork, undefined);
+  assert.equal(result.current.url, `https://www.douyin.com/video/${f.id}`);
+  assert.equal(f.events.filter(event => event.type === 'watch.profile-modal-fallback').length, 1);
+});
+
+test('登录验证和其他弹层异常不触发直链回退', async t => {
+  for (const error of [new Error('合成停止'), Object.assign(new Error('合成验证'), { code: 'PROFILE_MODAL_NEEDS_USER', watchStatus: 'needs_user' })]) {
+    const f = profileFixture(t, () => { throw error; });
+    await assert.rejects(f.watch.visitAuthor({ video: { authorSecUid: f.secUid } }), reason => reason === error);
+    assert.equal(f.profileCalls.filter(call => call.name === 'douyin_open_video').length, 1);
+    assert.equal(f.events.some(event => event.type === 'watch.profile-modal-fallback'), false);
+  }
+});
+
 test('冷启动从空白加载页有界等待到就绪，再观察和请求模型', async t => {
   const f = fixture(t), original = f.controller.execute; let statuses = 0, observations = 0;
   f.controller.execute = async (...args) => {
